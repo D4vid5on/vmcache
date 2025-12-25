@@ -22,6 +22,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <immintrin.h>
+#include <map>
+
 
 #include "exmap.h"
 
@@ -1290,6 +1292,14 @@ struct BTreeNode : public BTreeNodeHeader {
       return getChild(pos);
    }
 };
+struct LsmRootPage
+{
+   bool dirty;
+   atomic<u64> SSTableIdId;
+   LsmRootPage() : dirty(false), SSTableIdId(0) {}
+};
+
+
 
 static_assert(sizeof(BTreeNode) == pageSize, "btree node size problem");
 
@@ -1437,6 +1447,394 @@ struct BTree {
       }
    }
 };
+
+
+
+
+
+struct MemtableEntry
+{
+   string payload;
+   bool isTombstone = false;
+   MemtableEntry(span<u8> payload_span, bool tombstone = false) :
+   payload(reinterpret_cast<const char*>(payload_span.data()), payload_span.size()) {};
+   MemtableEntry() = default;
+};
+using Memtable = map<string, MemtableEntry>;
+
+struct SSTableMetadata
+{
+   u64 fileID;
+   u32 level;
+   string minKey;
+   string maxKey;
+   u64 blockIndexOffset;
+   u32 numBlocks;
+   u64 bloomFilterOffset;
+   u32 bloomFilterSize;
+
+};
+constexpr u32 SSTABLE_BLOCK_SIZE = 4096;
+
+struct BlockIndexEntry
+{
+   string lastKey;
+   u64 blockOffset;     // to access the data of the block
+};
+
+class Serializer
+{
+private:
+   u8* buffer;
+   u64 offset;
+public:
+   Serializer (u8* buf, u64 initial_off = 0) : buffer(buf), offset(initial_off) {}
+   u64 getOffset() const { return offset; }
+   void write (const auto& value)
+   {
+      memcpy(buffer+offset, &value, sizeof(value));
+      offset += sizeof(value);
+   }
+   void writeKey(const string& key)
+   {
+      u16 len = key.size();
+      if (len > 256) {assert(len <= 256);}
+      write(len);
+      memcpy(buffer+offset, key.data(), len);
+      offset += len;
+   }
+   void writeSpan(span<u8> data)
+   {
+      memcpy(buffer+offset, data.data(), data.size());
+      offset += data.size();
+   }
+};
+
+class SSTableWriter
+{
+private:
+   u64 fileFD;
+   u64 currentOffset;
+   vector<u8> blockBuffer;
+   vector<BlockIndexEntry> blockIndex;
+   void writeBlock(const u8* data, u64 size);
+   void writeIndexAndMetadata(SSTableMetadata& metadata);
+   u64 getRecordSize(const string& key, const MemtableEntry& entry);
+   u64 serializeRecord(u8* buffer, u64 currentPosition, const string& key, const MemtableEntry& entry);
+public:
+   explicit SSTableWriter (u64 FileID, const string& directory = "/tmp/sstables")    // set up the location where sstables will be store on disk
+      : currentOffset(SSTABLE_BLOCK_SIZE)  // saving first block for metadata
+   {
+      string path = directory + "/" + to_string(FileID) + ".sst";
+      mkdir(directory.c_str(), 0777);
+      fileFD = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_DIRECT, 0644);
+      if (fileFD < 0)
+      {
+         throw runtime_error("Failed to sstable file " + path);
+      }
+      blockBuffer.resize(SSTABLE_BLOCK_SIZE);
+      currentOffset = SSTABLE_BLOCK_SIZE;
+   }
+   ~SSTableWriter();
+   SSTableMetadata writeMemtable(Memtable& memtable, u8 targetLevel);
+
+};
+// get size of memtable entry
+u64 SSTableWriter::getRecordSize(const string& key, const MemtableEntry& entry)
+{
+   return sizeof(u16) + key.size() + sizeof(u16) + entry.payload.size() + sizeof(u8);
+}
+   // serialize a memtableEntry in the buffer
+u64 SSTableWriter::serializeRecord(u8* buffer, u64 currentPosition, const string& key, const MemtableEntry& entry)
+{
+   u8* start = buffer + currentPosition;
+   u8* ptr = start;
+   u16 keyLen = key.size();
+   u16 payloadLen = entry.payload.size();
+   u8 isTombstone = entry.isTombstone;
+   memcpy(ptr, &keyLen, sizeof(keyLen));  //key
+   ptr += sizeof(keyLen);
+   memcpy(ptr, key.data(), keyLen);
+   ptr += keyLen;
+   memcpy(ptr, &payloadLen, sizeof(u16) );   //payload
+   ptr += sizeof(u16);
+   memcpy(ptr, entry.payload.data(), payloadLen);
+   ptr += payloadLen;
+   memcpy(ptr, &isTombstone, sizeof(u8));
+   ptr += sizeof(u8);
+   return static_cast<u64>(ptr - start);   // return size of the write
+}
+   // write a block to the file
+void SSTableWriter::writeBlock(const u8* data, u64 size)
+{
+   assert(currentOffset % SSTABLE_BLOCK_SIZE == 0);
+   vector<u8> paddedBlock(SSTABLE_BLOCK_SIZE, 0);
+   memcpy(paddedBlock.data(), data, size);
+   ssize_t result = pwrite(fileFD, paddedBlock.data(), SSTABLE_BLOCK_SIZE, currentOffset);
+   assert(result == SSTABLE_BLOCK_SIZE);
+   currentOffset += SSTABLE_BLOCK_SIZE;
+}
+
+void SSTableWriter::writeIndexAndMetadata(SSTableMetadata& metadata)
+{
+   metadata.blockIndexOffset = currentOffset;
+   metadata.numBlocks = blockIndex.size();
+   u64 indexSize = 0;
+   for (const auto& entry : blockIndex) // write the index to disk, as many entries per block as we can fit
+   {
+      if (indexSize + getRecordSize(entry.lastKey, {}) > SSTABLE_BLOCK_SIZE)
+      {
+         writeBlock(blockBuffer.data(), indexSize);
+         indexSize = 0;
+      }
+      u8* ptr = blockBuffer.data() + indexSize;
+      u16 keyLen = entry.lastKey.size();
+      memcpy(ptr, &keyLen, sizeof(u16));
+      ptr += sizeof(u16);
+      memcpy(ptr, entry.lastKey.data(), keyLen);
+      ptr += keyLen;
+      memcpy(ptr, &entry.blockOffset, sizeof(u64));
+      ptr += sizeof(u64);
+      indexSize += sizeof(u64) + sizeof(u16) + keyLen;
+   }
+   if (indexSize > 0)
+   {
+      writeBlock(blockBuffer.data(), indexSize);
+   }
+   vector<u8> metaBuf(SSTABLE_BLOCK_SIZE, 0);
+   Serializer metaSerializer(blockBuffer.data());
+   metaSerializer.write(metadata.fileID);
+   metaSerializer.write(metadata.level);
+   metaSerializer.write(metadata.minKey);
+   metaSerializer.write(metadata.maxKey);
+   metaSerializer.write(metadata.blockIndexOffset);
+   metaSerializer.write(metadata.numBlocks);
+   metaSerializer.write(metadata.bloomFilterOffset);
+   metaSerializer.write((metadata.bloomFilterSize));
+   ssize_t result = pwrite(fileFD, metaBuf.data(), SSTABLE_BLOCK_SIZE, 0);
+   assert(result == SSTABLE_BLOCK_SIZE);
+   close(fileFD);
+}
+
+struct LsmTree
+{
+private:
+   static constexpr u64 LSM_ROOT_ID = 1;
+   static constexpr size_t MEMTABLE_CAPACITY = 16 * 1024 * 1024;
+   Memtable memtable;
+   mutex memtableMutex;
+   atomic<size_t> memtableSize{0};
+   vector<Memtable> immutableMemtables;
+   mutex immutableMemtablesMutex;
+   BTree dummy;
+   void flush();  // flushing the memtable to immutable tables queue
+   void sstableFlush();   // for the background threads to use to flush immutable tables to disk
+public:
+   unsigned slotId;
+   atomic<bool> splitOrdered;
+   LsmTree() : splitOrdered(false) { slotId = dummy.slotId; }
+   ~LsmTree() {}
+
+   static u64 getFileId();
+   void insert(span<u8> key, span<u8> payload);
+   template<class Fn>
+   bool lookup(span<u8> key, Fn fn);
+   bool remove(span<u8> key);
+   template<class Fn>
+   void scanAsc(span<u8> key, Fn fn)
+   {
+      dummy.scanAsc(key, fn);
+   }
+   template<class Fn>
+   void scanDesc(span<u8> key, Fn fn)
+   {
+      dummy.scanDesc(key, fn);
+   }
+   template<class Fn>
+   bool updateInPlace(span<u8> key, Fn fn)
+   {
+      return dummy.updateInPlace(key, fn);
+   }
+};
+u64 LsmTree::getFileId()
+{
+   GuardX<LsmRootPage> pid_lock(LSM_ROOT_ID);
+   const u64 id = pid_lock->SSTableIdId.fetch_add(1);
+   pid_lock->dirty = true;
+   return id;
+}
+
+
+SSTableMetadata SSTableWriter::writeMemtable(Memtable& memtable, u8 targetLevel)
+{
+   assert(fileFD > 0);
+   SSTableMetadata metadata = {};
+   metadata.level = targetLevel;
+   metadata.fileID = LsmTree::getFileId();
+   u64 currentBlockSize = 0;
+   u64 blockOffset1 = 0;
+   string lastKeyInBlock = "";
+   string firstKeyInTable = "";
+   for (auto& [key, entry] : memtable)
+   {
+      if (firstKeyInTable.empty())
+      {
+         firstKeyInTable = key;
+      }
+      if (currentBlockSize + getRecordSize(key, entry) > SSTABLE_BLOCK_SIZE)   // check if entry fits in block
+      {
+         blockIndex.push_back({.lastKey = lastKeyInBlock, .blockOffset = blockOffset1});
+         writeBlock(blockBuffer.data(), currentBlockSize);
+         blockOffset1 = currentOffset;
+         currentBlockSize = 0;
+      }
+      currentBlockSize += serializeRecord(blockBuffer.data(), currentBlockSize, key, entry);
+      lastKeyInBlock = key;
+   }
+   if (currentBlockSize > 0) // write what is still in the buffer
+   {
+      blockIndex.push_back({.lastKey = lastKeyInBlock, .blockOffset = blockOffset1});
+      writeBlock(blockBuffer.data(), currentBlockSize);
+   }
+   metadata.minKey = firstKeyInTable;
+   metadata.maxKey = lastKeyInBlock;
+   writeIndexAndMetadata(metadata);
+   return metadata;
+}
+
+void LsmTree::insert(span<u8> key, span<u8> payload)
+{
+   for (u64 repeat = 0; ; repeat++) {
+      try
+         {
+         string keyStr(reinterpret_cast<const char*>(key.data()), key.size());
+         unique_lock<mutex> lock(memtableMutex);
+         size_t entry_size;
+         auto it = memtable.find(keyStr);  // check if entry key is already in the memtable map
+         if (it != memtable.end())  // if it is the entry_size is the difference in payload sizes
+         {
+            entry_size = payload.size() - it->second.payload.size();
+         }
+         else   // if it is not in, it is total size of entry
+         {
+            entry_size = sizeof(MemtableEntry) + keyStr.size() + payload.size();
+         }
+         if (memtableSize.load() + entry_size > MEMTABLE_CAPACITY)  // if buffer full, flush
+         {
+            lock.unlock();
+            flush();
+            throw OLCRestartException();
+         }
+         if (it != memtable.end())
+         {
+            it->second = MemtableEntry(payload);
+         }
+         else
+         {
+            memtable.emplace(move(keyStr), MemtableEntry(payload));
+         }
+         memtableSize += entry_size;
+         return; // Success, exit infinite loop
+      }
+      catch (const OLCRestartException&)
+      {
+         yield(repeat);
+      }
+   }
+}
+
+void LsmTree::flush()
+{
+   lock_guard<mutex> active_lock(memtableMutex);
+   {
+      lock_guard<mutex> immutable_lock(immutableMemtablesMutex);
+      immutableMemtables.push_back(std::move(memtable));
+   }
+   memtableSize = 0;
+   // TODO: add asynchronous flush to disk of immutable tables
+}
+
+template<class Fn>
+bool LsmTree::lookup(span<u8> key, Fn fn)
+{
+   string keyStr(reinterpret_cast<const char*>(key.data()), key.size());
+   {                                                    // check memtable
+      lock_guard<mutex> lock(memtableMutex);
+      auto it = memtable.find(keyStr);
+      if (it != memtable.end())
+      {
+         if (!it->second.isTombstone)
+         {
+            span<u8> payload_span(reinterpret_cast<u8*>(it->second.payload.data()), it->second.payload.size());
+            fn(payload_span);
+            return true;
+         }
+      }
+   }
+   {
+      lock_guard<mutex> lock(immutableMemtablesMutex);    // check immutable memtables from newest to oldest
+      for (auto it = immutableMemtables.rbegin(); it != immutableMemtables.rend(); ++it)
+      {
+         auto mem_it = it->find(keyStr);
+         if (mem_it != it->end())
+         {
+            if (!mem_it->second.isTombstone)
+            {
+               span<u8> payload_span(reinterpret_cast<u8*>(mem_it->second.payload.data()), mem_it->second.payload.size());
+               fn(payload_span);
+               return true;
+            }
+            return false;
+         }
+      }
+      return false;  // remove when implementing lookup in sstables
+   }
+   // TODO : check SSTables
+   return dummy.lookup(key, fn);
+}
+
+bool LsmTree::remove(span<u8> key)
+{
+   span<u8> empty_payload = {};
+   for (u64 repeat = 0; ; repeat++) {
+      try
+      {
+         string keyStr(reinterpret_cast<const char*>(key.data()), key.size());
+         unique_lock<mutex> lock(memtableMutex);
+         size_t entry_size;
+         auto it = memtable.find(keyStr);  // check if entry key is in the memtable map
+         if (it != memtable.end())  // if it is the entry_size is the deleted payload size
+         {
+            entry_size = 0 - it->second.payload.size();
+         }
+         else   // if it is not in, it is overhead of entry with 0 payload
+         {
+            entry_size = sizeof(MemtableEntry) + keyStr.size();
+         }
+         if (memtableSize.load() + entry_size > MEMTABLE_CAPACITY)  // if buffer full, flush
+         {
+            lock.unlock();
+            flush();
+            throw OLCRestartException();
+         }
+         if (it != memtable.end())
+         {
+            it->second = MemtableEntry(empty_payload, true);
+         }
+         else
+         {
+            memtable.emplace(move(keyStr), MemtableEntry(empty_payload, true));
+         }
+         memtableSize += entry_size;
+         return true; // Success, exit infinite loop
+      }
+      catch (const OLCRestartException&)
+      {
+         yield(repeat);
+      }
+   }
+}
+
 
 static unsigned btreeslotcounter = 0;
 
@@ -1586,10 +1984,19 @@ void handleSEGFAULT(int signo, siginfo_t* info, void* extra) {
    }
 }
 
+#ifdef USE_LSM_TREE
+   using Tree = LsmTree;
+   #define TREE "LsmTree"
+#else
+   using Tree = BTree;
+   #define TREE "BTree"
+#endif
+
+
 template <class Record>
 struct vmcacheAdapter
 {
-   BTree tree;
+   Tree tree;
 
    public:
    void scan(const typename Record::Key& key, const std::function<bool(const typename Record::Key&, const Record&)>& found_record_cb, std::function<void()> reset_if_scan_failed_cb) {
@@ -1694,7 +2101,7 @@ void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
       nthreads = n;
    uint64_t perThread = n/nthreads;
    for (unsigned i=0; i<nthreads; i++) {
-      threads.emplace_back([&,i]() {
+     threads.emplace_back([&,i]() {
          uint64_t b = (perThread*i) + begin;
          uint64_t e = (i==(nthreads-1)) ? end : (b+perThread);
          fn(i, b, e);
@@ -1739,7 +2146,7 @@ int main(int argc, char** argv) {
    };
 
    if (isRndread) {
-      BTree bt;
+      Tree bt;
       bt.splitOrdered = true;
 
       {
