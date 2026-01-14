@@ -1295,8 +1295,8 @@ struct BTreeNode : public BTreeNodeHeader {
 struct LsmRootPage
 {
    bool dirty;
-   atomic<u64> SSTableIdId;
-   LsmRootPage() : dirty(false), SSTableIdId(0) {}
+   atomic<u64> SSTableId;
+   LsmRootPage() : dirty(false), SSTableId(0) {}
 };
 
 
@@ -1308,7 +1308,7 @@ static const u64 metadataPageId = 0;
 struct MetaDataPage {
    bool dirty;
    PID roots[(pageSize-8)/8];
-
+   PID lsmRootPid;
    PID getRoot(unsigned slot) { return roots[slot]; }
 };
 
@@ -1605,8 +1605,8 @@ void SSTableWriter::writeIndexAndMetadata(SSTableMetadata& metadata)
    Serializer metaSerializer(blockBuffer.data());
    metaSerializer.write(metadata.fileID);
    metaSerializer.write(metadata.level);
-   metaSerializer.write(metadata.minKey);
-   metaSerializer.write(metadata.maxKey);
+   metaSerializer.writeKey(metadata.minKey);
+   metaSerializer.writeKey(metadata.maxKey);
    metaSerializer.write(metadata.blockIndexOffset);
    metaSerializer.write(metadata.numBlocks);
    metaSerializer.write(metadata.bloomFilterOffset);
@@ -1632,7 +1632,21 @@ private:
 public:
    unsigned slotId;
    atomic<bool> splitOrdered;
-   LsmTree() : splitOrdered(false) { slotId = dummy.slotId; }
+   PID rootPageId;
+
+   LsmTree() : splitOrdered(false)
+   {
+      slotId = dummy.slotId;
+      GuardX<MetaDataPage> meta(0);
+      if (meta->lsmRootPid == 0)
+      {
+         AllocGuard<LsmRootPage> root;
+         meta->lsmRootPid = root.pid;
+         root->SSTableId = 1;
+         root->dirty = true;
+      }
+      this->rootPageId = meta->lsmRootPid;
+   }
    ~LsmTree() {}
 
    static u64 getFileId();
@@ -1659,7 +1673,7 @@ public:
 u64 LsmTree::getFileId()
 {
    GuardX<LsmRootPage> pid_lock(LSM_ROOT_ID);
-   const u64 id = pid_lock->SSTableIdId.fetch_add(1);
+   const u64 id = pid_lock->SSTableId.fetch_add(1);
    pid_lock->dirty = true;
    return id;
 }
@@ -1734,6 +1748,7 @@ void LsmTree::insert(span<u8> key, span<u8> payload)
             memtable.emplace(move(keyStr), MemtableEntry(payload));
          }
          memtableSize += entry_size;
+         dummy.insert(key, payload);
          return; // Success, exit infinite loop
       }
       catch (const OLCRestartException&)
@@ -1787,7 +1802,6 @@ bool LsmTree::lookup(span<u8> key, Fn fn)
             return false;
          }
       }
-      return false;  // remove when implementing lookup in sstables
    }
    // TODO : check SSTables
    return dummy.lookup(key, fn);
@@ -1803,7 +1817,7 @@ bool LsmTree::remove(span<u8> key)
          unique_lock<mutex> lock(memtableMutex);
          size_t entry_size;
          auto it = memtable.find(keyStr);  // check if entry key is in the memtable map
-         if (it != memtable.end())  // if it is the entry_size is the deleted payload size
+         if (it != memtable.end())  // if it is, the entry_size is the deleted payload size
          {
             entry_size = 0 - it->second.payload.size();
          }
@@ -1826,6 +1840,7 @@ bool LsmTree::remove(span<u8> key)
             memtable.emplace(move(keyStr), MemtableEntry(empty_payload, true));
          }
          memtableSize += entry_size;
+         dummy.remove(key);
          return true; // Success, exit infinite loop
       }
       catch (const OLCRestartException&)
