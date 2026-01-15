@@ -1,6 +1,7 @@
 #include <atomic>
 #include <algorithm>
 #include <cassert>
+#include <condition_variable>
 #include <csignal>
 #include <exception>
 #include <fcntl.h>
@@ -1626,6 +1627,10 @@ private:
    atomic<size_t> memtableSize{0};
    vector<Memtable> immutableMemtables;
    mutex immutableMemtablesMutex;
+   thread flusherThread;
+   condition_variable flusherCond;
+   atomic<bool> shutDown{false};
+   void backgroundFlush();
    BTree dummy;
    void flush();  // flushing the memtable to immutable tables queue
    void sstableFlush();   // for the background threads to use to flush immutable tables to disk
@@ -1646,8 +1651,14 @@ public:
          root->dirty = true;
       }
       this->rootPageId = meta->lsmRootPid;
+      flusherThread = std::thread(&LsmTree::backgroundFlush, this);
    }
-   ~LsmTree() {}
+   ~LsmTree()
+   {
+      shutDown = true;
+      flusherCond.notify_all();
+      if (flusherThread.joinable()) flusherThread.join();
+   }
 
    static u64 getFileId();
    void insert(span<u8> key, span<u8> payload);
@@ -1760,14 +1771,50 @@ void LsmTree::insert(span<u8> key, span<u8> payload)
 
 void LsmTree::flush()
 {
-   lock_guard<mutex> active_lock(memtableMutex);
    {
-      lock_guard<mutex> immutable_lock(immutableMemtablesMutex);
-      immutableMemtables.push_back(std::move(memtable));
+      lock_guard<mutex> active_lock(memtableMutex);
+      {
+         lock_guard<mutex> immutable_lock(immutableMemtablesMutex);
+         immutableMemtables.push_back(std::move(memtable));
+      }
+      memtableSize = 0;
    }
-   memtableSize = 0;
+   flusherCond.notify_one();
+
    // TODO: add asynchronous flush to disk of immutable tables
 }
+
+void LsmTree::backgroundFlush()
+{
+   workerThreadId = 100;
+   while (true)
+   {
+      Memtable memtableToFlush;
+      {
+         unique_lock<mutex> lock(immutableMemtablesMutex);
+         flusherCond.wait(lock, [this]
+         {
+            return !immutableMemtables.empty() || shutDown;
+         });
+         if (shutDown && immutableMemtables.empty()) break;
+         memtableToFlush = move(immutableMemtables.front());
+         immutableMemtables.erase(immutableMemtables.begin());
+      }
+      if (!memtableToFlush.empty())
+      {
+         try
+         {
+            u64 nextId = getFileId();
+            SSTableWriter writer(nextId);
+            SSTableMetadata metadata = writer.writeMemtable(memtableToFlush, 0);
+         } catch (const exception& e)
+         {
+            cerr << "Failed flush" << e.what() << endl;
+         }
+      }
+   }
+}
+
 
 template<class Fn>
 bool LsmTree::lookup(span<u8> key, Fn fn)
