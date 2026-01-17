@@ -24,6 +24,7 @@
 #include <unistd.h>
 #include <immintrin.h>
 #include <map>
+#include <shared_mutex>
 
 
 #include "exmap.h"
@@ -1293,13 +1294,25 @@ struct BTreeNode : public BTreeNodeHeader {
       return getChild(pos);
    }
 };
+
+
+struct Level0Entry
+{
+   u64 fileID;
+   char minKey[32];
+   char maxKey[32];
+};
+
 struct LsmRootPage
 {
    bool dirty;
    atomic<u64> SSTableId;
-   LsmRootPage() : dirty(false), SSTableId(0) {}
+   static const u32 L0_COMPACTION_TRIGGER = 8;
+   static const u32 MAX_L0_FILES = 20;
+   u32 l0_count;
+   Level0Entry l0Entries[MAX_L0_FILES];
+   LsmRootPage() : dirty(false), SSTableId(0), l0_count(0) {}
 };
-
 
 
 static_assert(sizeof(BTreeNode) == pageSize, "btree node size problem");
@@ -1531,7 +1544,7 @@ public:
       fileFD = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_DIRECT, 0644);
       if (fileFD < 0)
       {
-         throw runtime_error("Failed to sstable file " + path);
+         throw runtime_error("Failed to  open sstable file " + path);
       }
       blockBuffer.resize(SSTABLE_BLOCK_SIZE);
       currentOffset = SSTABLE_BLOCK_SIZE;
@@ -1581,12 +1594,14 @@ void SSTableWriter::writeIndexAndMetadata(SSTableMetadata& metadata)
    metadata.blockIndexOffset = currentOffset;
    metadata.numBlocks = blockIndex.size();
    u64 indexSize = 0;
+   fill(blockBuffer.begin(), blockBuffer.end(), 0);
    for (const auto& entry : blockIndex) // write the index to disk, as many entries per block as we can fit
    {
       if (indexSize + getRecordSize(entry.lastKey, {}) > SSTABLE_BLOCK_SIZE)
       {
          writeBlock(blockBuffer.data(), indexSize);
          indexSize = 0;
+         fill(blockBuffer.begin(), blockBuffer.end(), 0);
       }
       u8* ptr = blockBuffer.data() + indexSize;
       u16 keyLen = entry.lastKey.size();
@@ -1602,7 +1617,6 @@ void SSTableWriter::writeIndexAndMetadata(SSTableMetadata& metadata)
    {
       writeBlock(blockBuffer.data(), indexSize);
    }
-   vector<u8> metaBuf(SSTABLE_BLOCK_SIZE, 0);
    Serializer metaSerializer(blockBuffer.data());
    metaSerializer.write(metadata.fileID);
    metaSerializer.write(metadata.level);
@@ -1612,10 +1626,106 @@ void SSTableWriter::writeIndexAndMetadata(SSTableMetadata& metadata)
    metaSerializer.write(metadata.numBlocks);
    metaSerializer.write(metadata.bloomFilterOffset);
    metaSerializer.write((metadata.bloomFilterSize));
-   ssize_t result = pwrite(fileFD, metaBuf.data(), SSTABLE_BLOCK_SIZE, 0);
+   ssize_t result = pwrite(fileFD, blockBuffer.data(), SSTABLE_BLOCK_SIZE, 0);
    assert(result == SSTABLE_BLOCK_SIZE);
    close(fileFD);
 }
+
+class SSTableReader
+{
+private:
+   int fd;
+   SSTableMetadata metadata;
+   vector<BlockIndexEntry> index;
+   u8* blockBuffer;
+
+public:
+   SSTableReader(u64 fileID, const string& dir = "tmp/sstables" )
+   {
+      string path = dir + "/" + to_string(fileID) + ".sst";
+      fd = open(path.c_str(), O_RDONLY | O_DIRECT);
+      if (fd < 0) throw std::runtime_error("Failed to open sst file " + path);
+      blockBuffer = (u8*)aligned_alloc(4096, 4096);
+      if (pread(fd, blockBuffer, 4096, 0) != 4096) throw std::runtime_error("Failed to read sst file " + path);
+      u8* ptr = blockBuffer;
+      memcpy(&metadata.fileID, ptr, sizeof(u64)); ptr += sizeof(u64);
+      memcpy(&metadata.level, ptr, sizeof(u32)); ptr += sizeof(u32);
+      auto readString = [&](string& str)
+      {
+         u16 len;
+         memcpy(&len, ptr, sizeof(u16)); ptr += sizeof(u16);
+         str.assign((char*) ptr, len); ptr += len;
+      };
+      readString(metadata.minKey);
+      readString(metadata.maxKey);
+      memcpy(&metadata.blockIndexOffset, ptr, sizeof(u64)); ptr += sizeof(u64);
+      memcpy(&metadata.numBlocks, ptr, sizeof(u32)); ptr += sizeof(u32);
+      loadIndex();
+   }
+   ~SSTableReader()
+   {
+      if (fd >= 0) close(fd);
+      free(blockBuffer);
+   }
+   void loadIndex();
+   template<class Fn>
+   bool lookup(span<u8> key, Fn fn)
+   { // efficient binary search
+      auto it = lower_bound(index.begin(), index.end(), key, [](const BlockIndexEntry& entry, span<u8> k)
+      {
+         string_view entryKey(entry.lastKey);
+         string_view searchKey((char*)k.data(), k.size());
+         return entryKey < searchKey;  // this comparator is used to eliminate the invalid options, that is why it looks like it is the wrong way around
+      });
+      if (it == index.end()) return false;
+      if (pread(fd, blockBuffer, SSTABLE_BLOCK_SIZE, it->blockOffset) != SSTABLE_BLOCK_SIZE) return false; // read the candidate block
+      u64 offset = 0;
+      while (offset < SSTABLE_BLOCK_SIZE)
+      {
+         u16 keyLen;
+         memcpy(&keyLen, blockBuffer + offset, sizeof(u16));
+         if (keyLen == 0) break;
+         u8* keyPtr = blockBuffer + offset + sizeof(u16);
+         u16 payloadLen;
+         memcpy(&payloadLen, keyPtr + keyLen, sizeof(u16));
+         u8* payloadPtr = keyPtr + keyLen + sizeof(u16);
+         u8 isTombstone = *(payloadPtr + payloadLen);
+         if (keyLen == key.size() && memcmp(keyPtr, key.data(), keyLen) == 0)
+         {
+            if (isTombstone) return true;
+            fn(span<u8>(payloadPtr, payloadLen));
+            return true;
+         }
+         offset += sizeof(u16) + keyLen + sizeof(u16) + payloadLen + sizeof(u8);
+      }
+      return false;
+   }
+};
+
+void SSTableReader::loadIndex()
+{
+   u64 currentOffset = metadata.blockIndexOffset;
+   while (index.size() < metadata.numBlocks )   // read 4kb chunks until there are no more blockIndexEntries
+   {
+      if (pread(fd, blockBuffer, SSTABLE_BLOCK_SIZE, currentOffset) != SSTABLE_BLOCK_SIZE) break;
+      u64 bufferOffset = 0;
+      while (bufferOffset < SSTABLE_BLOCK_SIZE && index.size() < metadata.numBlocks)
+      {
+         u16 len;
+         memcpy(&len, blockBuffer + bufferOffset, sizeof(u16));
+         bufferOffset += sizeof(u16);
+         if (len == 0) break;
+         BlockIndexEntry entry;
+         entry.lastKey.assign((char*)(blockBuffer + bufferOffset), len);
+         bufferOffset += len;
+         memcpy(&entry.blockOffset, blockBuffer + bufferOffset, sizeof(u64));
+         bufferOffset += sizeof(u64);
+         index.push_back(move(entry));
+      }
+      currentOffset += SSTABLE_BLOCK_SIZE;
+   }
+}
+
 
 struct LsmTree
 {
@@ -1627,13 +1737,18 @@ private:
    atomic<size_t> memtableSize{0};
    vector<Memtable> immutableMemtables;
    mutex immutableMemtablesMutex;
+
    thread flusherThread;
    condition_variable flusherCond;
    atomic<bool> shutDown{false};
    void backgroundFlush();
+
+   unordered_map<u64, shared_ptr<SSTableReader>> readerCache;
+   shared_mutex readerMutex;
+   shared_ptr<SSTableReader> getReader(u64 fileID);
+
    BTree dummy;
    void flush();  // flushing the memtable to immutable tables queue
-   void sstableFlush();   // for the background threads to use to flush immutable tables to disk
 public:
    unsigned slotId;
    atomic<bool> splitOrdered;
@@ -1683,10 +1798,27 @@ public:
 };
 u64 LsmTree::getFileId()
 {
-   GuardX<LsmRootPage> pid_lock(LSM_ROOT_ID);
-   const u64 id = pid_lock->SSTableId.fetch_add(1);
-   pid_lock->dirty = true;
-   return id;
+   GuardS<LsmRootPage> pid_lock(LSM_ROOT_ID);
+   return pid_lock->SSTableId.fetch_add(1);
+
+}
+
+shared_ptr<SSTableReader> LsmTree::getReader(u64 fileID)
+{
+   {
+      shared_lock lock(readerMutex);   // faster if it is in cache
+      auto it = readerCache.find(fileID);
+      if (it != readerCache.end()) return it->second;
+   }
+   {
+      unique_lock lock(readerMutex);
+      auto it = readerCache.find(fileID);
+      if (it != readerCache.end()) return it->second;  // check again
+      auto reader = make_shared<SSTableReader>(fileID);
+      readerCache[fileID] = reader;
+      return reader;
+   }
+
 }
 
 
@@ -1729,6 +1861,10 @@ SSTableMetadata SSTableWriter::writeMemtable(Memtable& memtable, u8 targetLevel)
 
 void LsmTree::insert(span<u8> key, span<u8> payload)
 {
+   if (key.size() + payload.size() > SSTABLE_BLOCK_SIZE - 32) // 32 bytes left empty for tombstone, key length, payload length and extra for future
+   {
+      throw runtime_error("key / payload size too big");
+   }
    for (u64 repeat = 0; ; repeat++) {
       try
          {
@@ -1771,17 +1907,18 @@ void LsmTree::insert(span<u8> key, span<u8> payload)
 
 void LsmTree::flush()
 {
+   Memtable newMemtable;
    {
       lock_guard<mutex> active_lock(memtableMutex);
       {
          lock_guard<mutex> immutable_lock(immutableMemtablesMutex);
          immutableMemtables.push_back(std::move(memtable));
       }
+      memtable = move(newMemtable);
       memtableSize = 0;
    }
    flusherCond.notify_one();
 
-   // TODO: add asynchronous flush to disk of immutable tables
 }
 
 void LsmTree::backgroundFlush()
@@ -1807,6 +1944,23 @@ void LsmTree::backgroundFlush()
             u64 nextId = getFileId();
             SSTableWriter writer(nextId);
             SSTableMetadata metadata = writer.writeMemtable(memtableToFlush, 0);
+            {
+               GuardX<LsmRootPage> root(LSM_ROOT_ID);
+               if (root->l0_count < LsmRootPage::MAX_L0_FILES)
+               {
+                  u32 id = root->l0_count++;
+                  root->l0Entries[id].fileID = metadata.fileID;
+                  memset(root->l0Entries[id].minKey, 0, 32);
+                  memset(root->l0Entries[id].maxKey, 0, 32);
+                  memcpy(root->l0Entries[id].minKey, metadata.minKey.data(), min<size_t>(metadata.minKey.size(), 31));
+                  memcpy(root->l0Entries[id].maxKey, metadata.maxKey.data(), max<size_t>(metadata.maxKey.size(), 31));
+                  root->dirty = true;
+               }
+               else
+               {
+                  //TODO: add compaction to lvl 1
+               }
+            }
          } catch (const exception& e)
          {
             cerr << "Failed flush" << e.what() << endl;
@@ -1850,7 +2004,24 @@ bool LsmTree::lookup(span<u8> key, Fn fn)
          }
       }
    }
-   // TODO : check SSTables
+   vector<u64> candidateFiles;
+   {
+      GuardS<LsmRootPage> root(LSM_ROOT_ID);
+      for (int i = (int)root->l0_count - 1; i >= 0; i--)
+      {
+         string_view min(root->l0Entries[i].minKey);
+         string_view max(root->l0Entries[i].maxKey);
+         if (keyStr >= min && keyStr <= max)
+         {
+            candidateFiles.push_back(root->l0Entries[i].fileID);
+         }
+      }
+   }
+   for (u64 fileID : candidateFiles)
+   {
+      auto reader = getReader(fileID);
+      if (reader->lookup(key,fn)) return true;
+   }
    return dummy.lookup(key, fn);
 }
 
