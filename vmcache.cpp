@@ -1308,7 +1308,7 @@ struct Level0Entry
 struct LsmRootPage
 {
    bool dirty;
-   atomic<u64> SSTableId;
+   u64 nextSSTableId;
    static constexpr u32 MAX_L1_FILES = 100;
    static constexpr u32 L0_COMPACTION_TRIGGER = 5;
    static constexpr u32 MAX_L0_FILES = 10;
@@ -1316,7 +1316,7 @@ struct LsmRootPage
    Level0Entry l0Entries[MAX_L0_FILES];
    u32 l1_count;
    Level0Entry l1Entries[100];
-   LsmRootPage() : dirty(false), SSTableId(1), l0_count(0), l1_count(0){}
+   LsmRootPage() : dirty(false), l0_count(0), l1_count(0), nextSSTableId(1) {};
 };
 
 
@@ -1533,6 +1533,7 @@ class SSTableWriter
 {
 private:
    u64 fileFD;
+   u64 fileID;
    u64 currentOffset;
    vector<u8> blockBuffer;
    vector<BlockIndexEntry> blockIndex;
@@ -1546,14 +1547,14 @@ private:
    u64 serializeRecord(u8* buffer, u64 currentPosition, const string& key, const MemtableEntry& entry);
 public:
    explicit SSTableWriter (u64 FileID, const string& directory = "/tmp/sstables")    // set up the location where sstables will be store on disk
-      : currentOffset(SSTABLE_BLOCK_SIZE)  // saving first block for metadata
+      : currentOffset(SSTABLE_BLOCK_SIZE), fileID(FileID)  // saving first block for metadata
    {
       string path = directory + "/" + to_string(FileID) + ".sst";
       mkdir(directory.c_str(), 0777);
       fileFD = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_DIRECT, 0644);
       if (fileFD < 0)
       {
-         throw runtime_error("Failed to  open sstable file " + path);
+         throw runtime_error("Failed to  open (for writer) sstable file " + path);
       }
       blockBuffer.resize(SSTABLE_BLOCK_SIZE);
       currentOffset = SSTABLE_BLOCK_SIZE;
@@ -1662,7 +1663,7 @@ public:
    {
       string path = dir + "/" + to_string(fileID) + ".sst";
       fd = open(path.c_str(), O_RDONLY | O_DIRECT);
-      if (fd < 0) throw std::runtime_error("Failed to open sst file " + path);
+      if (fd < 0) throw std::runtime_error("Failed to open (for reader) sst file " + path);
       blockBuffer = (u8*)aligned_alloc(4096, 4096);
       if (pread(fd, blockBuffer, 4096, 0) != 4096) throw std::runtime_error("Failed to read sst file " + path);
       u8* ptr = blockBuffer;
@@ -1867,7 +1868,7 @@ public:
       {
          AllocGuard<LsmRootPage> root;
          meta->lsmRootPid = root.pid;
-         root->SSTableId = 1;
+         root->nextSSTableId = 1;
          root->dirty = true;
       }
       this->rootPageId = meta->lsmRootPid;
@@ -1903,9 +1904,10 @@ public:
 };
 u64 LsmTree::getFileId()
 {
-   GuardS<LsmRootPage> pid_lock(LSM_ROOT_ID);
-   return pid_lock->SSTableId.fetch_add(1);
-
+   GuardX<LsmRootPage> root(LSM_ROOT_ID);
+   u64 id =  root->nextSSTableId++;
+   root->dirty = true;
+   return id;
 }
 
 shared_ptr<SSTableReader> LsmTree::getReader(u64 fileID)
@@ -1932,7 +1934,7 @@ SSTableMetadata SSTableWriter::writeMemtable(Memtable& memtable, u8 targetLevel)
    assert(fileFD > 0);
    SSTableMetadata metadata = {};
    metadata.level = targetLevel;
-   metadata.fileID = LsmTree::getFileId();
+   metadata.fileID = this->fileID;
    memset(blockBuffer.data(), 0, SSTABLE_BLOCK_SIZE);
    for (auto& [key, entry] : memtable)
    {
@@ -2082,8 +2084,11 @@ void LsmTree::backgroundFlush()
          try
          {
             u64 nextId = getFileId();
+            SSTableMetadata metadata;
+         {
             SSTableWriter writer(nextId);
-            SSTableMetadata metadata = writer.writeMemtable(memtableToFlush, 0);
+            metadata = writer.writeMemtable(memtableToFlush, 0);
+         }
             bool triggerCompaction = false;
             {
                GuardX<LsmRootPage> root(LSM_ROOT_ID);
@@ -2130,11 +2135,17 @@ void LsmTree::compactL0() {
    vector<unique_ptr<SSTableIterator>> iterators; // one iterator for each ssTable in L0
    for (u64 fileID : l0Files)
    {
-      auto reader = getReader(fileID);
-      iterators.push_back(make_unique<SSTableIterator>(reader));
-      if (iterators.back()->cont)
+      try
       {
-         queue.push({iterators.back().get(), fileID});
+         auto reader = getReader(fileID);
+         iterators.push_back(make_unique<SSTableIterator>(reader));
+         if (iterators.back()->cont)
+         {
+            queue.push({iterators.back().get(), fileID});
+         }
+      } catch (...)
+      {
+         continue;
       }
    }
    u64 newID = getFileId();
@@ -2173,6 +2184,7 @@ void LsmTree::compactL0() {
    meta.level = 1;
    writer->finish(meta);
    finishedFiles.push_back(meta);
+   writer.reset();
    {
       GuardX<LsmRootPage> root(LSM_ROOT_ID);
       if (root->l0_count >= mergeNum)
@@ -2259,8 +2271,14 @@ bool LsmTree::lookup(span<u8> key, Fn fn)
    }
    for (u64 fileID : candidateFiles)
    {
-      auto reader = getReader(fileID);
-      if (reader->lookup(key,fn)) return true;
+      try
+      {
+         auto reader = getReader(fileID);
+         if (reader->lookup(key,fn)) return true;
+      } catch (...)
+      {
+         continue;
+      }
    }
    vector<u64> l1candidateFiles;
    {
@@ -2277,8 +2295,15 @@ bool LsmTree::lookup(span<u8> key, Fn fn)
    }
    for (u64 fileID : l1candidateFiles)
    {
-      auto reader = getReader(fileID);
-      if (reader->lookup(key,fn)) return true;
+      try
+      {
+         auto reader = getReader(fileID);
+         if (reader->lookup(key,fn)) return true;
+      }
+      catch (...)
+      {
+         continue;
+      }
    }
    return dummy.lookup(key, fn);
 }
