@@ -1301,22 +1301,37 @@ struct BTreeNode : public BTreeNodeHeader {
 struct Level0Entry
 {
    u64 fileID;
-   char minKey[32];
-   char maxKey[32];
+   u64 minKey;
+   u64 maxKey;
 };
 
 struct LsmRootPage
 {
    bool dirty;
    u64 nextSSTableId;
-   static constexpr u32 MAX_L1_FILES = 100;
-   static constexpr u32 L0_COMPACTION_TRIGGER = 5;
+   static constexpr u32 L0_COMPACTION_TRIGGER = 4;
    static constexpr u32 MAX_L0_FILES = 10;
+   static constexpr u32 MAX_L1_FILES = 20;
+   static constexpr u32 MAX_L2_FILES = 40;
+   static constexpr u32 MAX_L3_FILES = 80;
    u32 l0_count;
-   Level0Entry l0Entries[MAX_L0_FILES];
+   Level0Entry l0Entries[MAX_L0_FILES];  // overlapping key ranges
    u32 l1_count;
-   Level0Entry l1Entries[100];
-   LsmRootPage() : dirty(false), l0_count(0), l1_count(0), nextSSTableId(1) {};
+   Level0Entry l1Entries[MAX_L1_FILES];  // non-overlapping
+   u32 l2_count;
+   Level0Entry l2Entries[MAX_L2_FILES];  // non-overlapping
+   u32 l3_count;
+   Level0Entry l3Entries[MAX_L3_FILES];  // non-overlapping
+   LsmRootPage()
+   {
+      memset(this, 0, pageSize);
+      nextSSTableId = 1;
+      l0_count = 0;
+      l1_count = 0;
+      l2_count = 0;
+      l3_count = 0;
+      dirty = true;
+   };
 };
 
 
@@ -1547,8 +1562,9 @@ private:
    u64 serializeRecord(u8* buffer, u64 currentPosition, const string& key, const MemtableEntry& entry);
 public:
    explicit SSTableWriter (u64 FileID, const string& directory = "/tmp/sstables")    // set up the location where sstables will be store on disk
-      : currentOffset(SSTABLE_BLOCK_SIZE), fileID(FileID)  // saving first block for metadata
+      : currentOffset(SSTABLE_BLOCK_SIZE)  // saving first block for metadata
    {
+      fileID = FileID;
       string path = directory + "/" + to_string(FileID) + ".sst";
       mkdir(directory.c_str(), 0777);
       fileFD = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_DIRECT, 0644);
@@ -1832,17 +1848,26 @@ struct MergeIteratorEntry
    }
 };
 
+struct Compaction
+{
+   u16 sourceLevel;
+   vector<u64> sourceFiles;
+   vector<u64> destFiles;
+};
+
+
+static once_flag lsmFlag;
 struct LsmTree
 {
 private:
    static constexpr u64 LSM_ROOT_ID = 1;
-   static constexpr size_t MEMTABLE_CAPACITY = 16 * 1024 * 1024;
+   static constexpr size_t MEMTABLE_CAPACITY = 64 * 1024 * 1024;
    Memtable memtable;
    mutex memtableMutex;
    atomic<size_t> memtableSize{0};
    vector<Memtable> immutableMemtables;
    mutex immutableMemtablesMutex;
-
+   atomic<bool> levelCompacting[3] = {false, false, false};
    thread flusherThread;
    condition_variable flusherCond;
    atomic<bool> shutDown{false};
@@ -1854,7 +1879,11 @@ private:
 
    BTree dummy;
    void flush();// flushing the memtable to immutable tables queue
+   vector<SSTableMetadata> mergeOverlapping(const vector<u64>& filesToMerge, u16 targetLvl);
+   void applyMerge(u32* count, Level0Entry* entries, const vector<u64>& toRemove, const vector<SSTableMetadata>& toAdd, u32 maxCap);
+   void updateTables(u16 fromLvl, const vector<u64>& filesToCompact, u16 targetLvl, const vector<u64>& overlappingFiles, const vector<SSTableMetadata>& results);
    void compactL0();
+
 public:
    unsigned slotId;
    atomic<bool> splitOrdered;
@@ -1863,15 +1892,29 @@ public:
    LsmTree() : splitOrdered(false)
    {
       slotId = dummy.slotId;
-      GuardX<MetaDataPage> meta(0);
-      if (meta->lsmRootPid == 0)
+      call_once(lsmFlag, []
       {
-         AllocGuard<LsmRootPage> root;
-         meta->lsmRootPid = root.pid;
-         root->nextSSTableId = 1;
-         root->dirty = true;
+         GuardX<MetaDataPage> meta(0);
+         if (meta->lsmRootPid == 0)
+         {
+            AllocGuard<LsmRootPage> root;
+            memset(root.ptr, 0, pageSize);
+            meta->lsmRootPid = root.pid;
+            meta->dirty = true;
+            root->nextSSTableId = 1;
+            root->dirty = true;
+         }
+      });
+      {
+         GuardS<MetaDataPage> meta(0);
+         this->rootPageId = meta->lsmRootPid;
+         GuardX<LsmRootPage> root(this->rootPageId);
+         if (root->nextSSTableId == 0 || root->nextSSTableId > 1000000ull)
+         {
+            root->nextSSTableId = 1;
+            root->dirty = true;
+         }
       }
-      this->rootPageId = meta->lsmRootPid;
       flusherThread = std::thread(&LsmTree::backgroundFlush, this);
    }
    ~LsmTree()
@@ -1880,7 +1923,7 @@ public:
       flusherCond.notify_all();
       if (flusherThread.joinable()) flusherThread.join();
    }
-
+   void compactLevel(u16 sourceLevel);
    static u64 getFileId();
    void insert(span<u8> key, span<u8> payload);
    template<class Fn>
@@ -1909,6 +1952,8 @@ u64 LsmTree::getFileId()
    root->dirty = true;
    return id;
 }
+
+
 
 shared_ptr<SSTableReader> LsmTree::getReader(u64 fileID)
 {
@@ -2037,7 +2082,6 @@ void LsmTree::insert(span<u8> key, span<u8> payload)
             memtable.emplace(move(keyStr), MemtableEntry(payload));
          }
          memtableSize += entry_size;
-         dummy.insert(key, payload);
          return; // Success, exit infinite loop
       }
       catch (const OLCRestartException&)
@@ -2096,22 +2140,26 @@ void LsmTree::backgroundFlush()
                {
                   u32 id = root->l0_count++;
                   root->l0Entries[id].fileID = metadata.fileID;
-                  memset(root->l0Entries[id].minKey, 0, 32);
-                  memset(root->l0Entries[id].maxKey, 0, 32);
-                  memcpy(root->l0Entries[id].minKey, metadata.minKey.data(), min<size_t>(metadata.minKey.size(), 31));
-                  memcpy(root->l0Entries[id].maxKey, metadata.maxKey.data(), max<size_t>(metadata.maxKey.size(), 31));
+                  u64 minV = 0; u64 maxV = 0;
+                  memcpy(&minV, metadata.minKey.data(), min<size_t>(metadata.minKey.size(), sizeof(u64)));
+                  memcpy(&maxV, metadata.maxKey.data(), min<size_t>(metadata.maxKey.size(), sizeof(u64)));
+                  root->l0Entries[id].minKey = __builtin_bswap64(minV);
+                  root->l0Entries[id].maxKey = __builtin_bswap64(maxV);
                   root->dirty = true;
-                  if (root->l0_count >= 5)
+                  if (root->l0_count >= 5 && !levelCompacting[0].exchange(true))
                   {
                      triggerCompaction = true;
                   }
                }
+            }
                if (triggerCompaction)
                {
-                  root.release();
                   compactL0();
+                  {
+                     GuardS<LsmRootPage> root(LSM_ROOT_ID);
+                     cout<< "L0 count " << root->l0_count << endl;
+                  }
                }
-            }
          } catch (const exception& e)
          {
             cerr << "Failed flush" << e.what() << endl;
@@ -2122,18 +2170,64 @@ void LsmTree::backgroundFlush()
 
 void LsmTree::compactL0() {
    vector<u64> l0Files;
+   vector<u64> overlappingL1files;
    u16 mergeNum;
    {
       GuardS<LsmRootPage> root(LSM_ROOT_ID);
-      mergeNum = root->l0_count;
+      mergeNum = min<u16>(root->l0_count, 4);
+      if (mergeNum <= 0) {levelCompacting[0] = false;return;}
+      u64 min, max;
       for (u16 i = 0; i < mergeNum; i++)
       {
+         if (i ==0) {min = root->l0Entries[0].minKey; max = root->l0Entries[0].maxKey;}
          l0Files.push_back(root->l0Entries[i].fileID);
+         if (root->l0Entries[i].minKey < min) min = root->l0Entries[i].minKey;
+         if (root->l0Entries[i].maxKey > max) max = root->l0Entries[i].maxKey;
+      }
+      for (u16 i = 0; i < root->l1_count; i++)
+      {
+         u64 l1Min(root->l1Entries[i].minKey);
+         u64 l1Max(root->l1Entries[i].maxKey);
+         if (!(l1Max < min || l1Min > max))
+         {
+            overlappingL1files.push_back(root->l1Entries[i].fileID);
+         }
       }
    }
+   vector<u64> filesToMerge = l0Files;
+   filesToMerge.insert(filesToMerge.end(), overlappingL1files.begin(), overlappingL1files.end());
+   vector<SSTableMetadata> finishedFiles = mergeOverlapping(filesToMerge, 1);
+   updateTables(0, l0Files, 1, overlappingL1files, finishedFiles);
+
+   {
+      unique_lock lock(readerMutex);
+      for (u64 oldID : filesToMerge)
+      {
+         readerCache.erase(oldID);
+      }
+   }
+
+   for (u64 oldID : filesToMerge)
+   {
+      string path = "/tmp/sstables/" + to_string(oldID) + ".sst";
+      if (unlink(path.c_str()) != 0)
+      {
+         if (errno != ENOENT)
+         {
+            perror("unlink failed");
+            cout<< path << endl;
+         }
+      }
+   }
+   levelCompacting[0] = false;
+}
+
+
+vector<SSTableMetadata> LsmTree::mergeOverlapping(const vector<u64>& filesToMerge, u16 targetLevel)
+{
    priority_queue<MergeIteratorEntry, vector<MergeIteratorEntry>, greater<>> queue; // queue is sorted by key ascending based on the compare operator
    vector<unique_ptr<SSTableIterator>> iterators; // one iterator for each ssTable in L0
-   for (u64 fileID : l0Files)
+   for (u64 fileID : filesToMerge)
    {
       try
       {
@@ -2148,8 +2242,8 @@ void LsmTree::compactL0() {
          continue;
       }
    }
-   u64 newID = getFileId();
-   unique_ptr<SSTableWriter> writer = make_unique<SSTableWriter>(newID);
+   u64 newID;
+   unique_ptr<SSTableWriter> writer = nullptr;
    vector<SSTableMetadata> finishedFiles;
    string lastKey = "";
    bool first = true;
@@ -2160,6 +2254,11 @@ void LsmTree::compactL0() {
       string currentKey(top.it->key);
       if (first || currentKey != lastKey)
       {
+         if (!writer)
+         {
+            newID = getFileId();
+            writer = make_unique<SSTableWriter>(newID);
+         }
          writer->addRecord(top.it->key, top.it->payload, top.it->isTombstone); // we don't use writeMemtable() because it would use to much ram
          lastKey = currentKey;                                                // to load all sstable in RAM as levels get bigger
          first = false;
@@ -2167,11 +2266,10 @@ void LsmTree::compactL0() {
          {
             SSTableMetadata meta;
             meta.fileID = newID;
-            meta.level = 1;
+            meta.level = targetLevel;
             writer->finish(meta);
             finishedFiles.push_back(meta);
-            newID = getFileId();
-            writer = make_unique<SSTableWriter>(newID);
+            writer.reset();
          }
       }
       if (top.it->next())
@@ -2179,52 +2277,223 @@ void LsmTree::compactL0() {
          queue.push(top);
       }
    }
-   SSTableMetadata meta;
-   meta.fileID = newID;
-   meta.level = 1;
-   writer->finish(meta);
-   finishedFiles.push_back(meta);
-   writer.reset();
+   if (writer)
    {
-      GuardX<LsmRootPage> root(LSM_ROOT_ID);
-      if (root->l0_count >= mergeNum)
-      {
-         u16 remain = root->l0_count - mergeNum;
-         for (u16 i = 0; i < remain; i++)  // shift the remaining sstables to the front
-         {
-            root->l0Entries[i] = root->l0Entries[i + mergeNum];
-         }
-         root->l0_count = remain;
-      }
-      for (const auto& entry : finishedFiles)
-      {
-         if (root->l1_count < LsmRootPage::MAX_L1_FILES)
-         {
-            u32 id = root->l1_count++;
-            root->l1Entries[id].fileID = entry.fileID;
-            memset(root->l1Entries[id].minKey, 0, 32);
-            memset(root->l1Entries[id].maxKey, 0, 32);
-            memcpy(root->l1Entries[id].minKey, entry.minKey.data(), min<size_t>(entry.minKey.size(), 31));
-            memcpy(root->l1Entries[id].maxKey, entry.maxKey.data(), max<size_t>(entry.maxKey.size(), 31));
-         }
-      }
-      root->dirty = true;
+      SSTableMetadata meta;
+      meta.fileID = newID;
+      meta.level = targetLevel;
+      writer->finish(meta);
+      finishedFiles.push_back(meta);
+      writer.reset();
    }
-   for (u64 oldID : l0Files)
+   return finishedFiles;
+}
+
+void LsmTree::updateTables(u16 fromLvl, const vector<u64>& filesToCompact, u16 targetLvl, const vector<u64>& overlappingFiles, const vector<SSTableMetadata>& results)
+{
+   vector<SSTableMetadata> remaining = results;
+   vector<u64> overlapping = overlappingFiles;
+   vector<u64> fromLvlVictims = filesToCompact;
+   while (true)
    {
+      bool needSpace = false;
       {
-         unique_lock lock(readerMutex);
-         readerCache.erase(oldID);
+         GuardX<LsmRootPage> root(LSM_ROOT_ID);
+         u32* targetCount;
+         Level0Entry* targetEntries;
+         u32 maxCapacity;
+         if (targetLvl == 1)
+         {
+            targetCount = &root->l1_count;
+            targetEntries = root->l1Entries;
+            maxCapacity = LsmRootPage::MAX_L1_FILES;
+         } else if (targetLvl == 2)
+         {
+            targetCount = &root->l2_count;
+            targetEntries = root->l2Entries;
+            maxCapacity = LsmRootPage::MAX_L2_FILES;
+         } else if (targetLvl == 3) {
+            targetCount = &root->l3_count;
+            targetEntries = root->l3Entries;
+            maxCapacity = LsmRootPage::MAX_L3_FILES;
+            }
+         else
+         {
+            throw runtime_error("target level not supported");
+         }
+         u32 survivingFiles = *targetCount - overlapping.size();
+         u32 availableSlots = maxCapacity - survivingFiles;
+         u32 toAddCount = min<u32>(availableSlots, (u32)remaining.size());
+         if (availableSlots > 0 || remaining.empty())
+         {
+            if (!fromLvlVictims.empty())
+            {
+               if (fromLvl == 0)
+               {
+                  vector<Level0Entry> remainingL0;
+                  for (u32 i = 0; i < root->l0_count; i++)
+                  {
+                     bool victim = false;
+                     for (u64 id : fromLvlVictims)
+                     {
+                        if (root->l0Entries[i].fileID == id) {victim = true; break;}
+                     }
+                     if (!victim) remainingL0.push_back(root->l0Entries[i]);
+                  }
+                  root->l0_count = remainingL0.size();
+                  for (u32 i = 0; i < root->l0_count; i++)
+                  {
+                     root->l0Entries[i] = remainingL0[i];
+                  }
+               }
+               else
+               {
+                  u32* srcCount = fromLvl == 1 ? &root->l1_count : &root->l2_count;
+                  Level0Entry* srcEntries = fromLvl == 1 ? root->l1Entries : root->l2Entries;
+                  applyMerge(srcCount, srcEntries, fromLvlVictims, {}, (fromLvl == 1) ? LsmRootPage::MAX_L1_FILES : LsmRootPage::MAX_L2_FILES);
+               }
+               fromLvlVictims.clear();
+            }
+            vector<SSTableMetadata> batch;
+            for (u32 i = 0; i < toAddCount; i++)
+            {
+               batch.push_back(remaining.front());
+               remaining.erase(remaining.begin());
+            }
+            applyMerge(targetCount, targetEntries, overlapping, batch, maxCapacity);
+            overlapping.clear();
+            root->dirty = true;
+            if (remaining.empty())
+            {
+               return;
+            }
+         }
+         else{ needSpace = true;}
       }
-      string path = "/tmp/sstables/" + to_string(oldID) + ".sst";
-      unlink(path.c_str());
+      if (needSpace)
+      {
+         compactLevel(targetLvl);
+      }
+      this_thread::yield();
+   }
+}
+
+void LsmTree::applyMerge(u32* count, Level0Entry* entries, const vector<u64>& toRemove, const vector<SSTableMetadata>& toAdd, u32 maxCap)
+{
+   vector<Level0Entry> keep;
+   for (u32 i = 0; i < *count; i++)
+   {
+      bool toDelete = false;
+      for (u64 id : toRemove)
+      {
+         if (entries[i].fileID == id)
+         {
+            toDelete = true; break;
+         }
+      }
+      if (!toDelete)
+      {
+         keep.push_back(entries[i]);
+      }
+   }
+   for (auto& m : toAdd)
+   {
+      Level0Entry entry;
+      entry.fileID = m.fileID;
+      u64 minV = 0; u64 maxV = 0;
+      memcpy(&minV, m.minKey.data(), min<size_t>(m.minKey.size(), sizeof(u64)));
+      memcpy(&maxV, m.maxKey.data(), min<size_t>(m.maxKey.size(), sizeof(u64)));
+      entry.minKey = __builtin_bswap64(minV);
+      entry.maxKey = __builtin_bswap64(maxV);
+      keep.push_back(entry);
+   }
+   sort(keep.begin(), keep.end(), [](const Level0Entry& a, const Level0Entry& b)
+   {
+      return a.minKey < b.minKey;
+   });
+   *count = min<u32>((u32)keep.size(), maxCap);
+   for (u32 i = 0; i < *count; i++)
+   {
+      entries[i] = keep[i];
    }
 }
 
 
+
+void LsmTree::compactLevel(u16 sourceLevel)
+{
+   u16 destLevel = sourceLevel + 1;
+   if (destLevel > 3 || sourceLevel <= 0) return;  // maximum L3
+   if (levelCompacting[sourceLevel].exchange(true))
+   {
+      return;
+   }
+   vector<u64> sourceVictims;
+   vector<u64> overlapping;
+   {
+      GuardS<LsmRootPage> root(LSM_ROOT_ID);
+      u32 count = sourceLevel == 1 ? root->l1_count : root->l2_count;
+      Level0Entry* sourceEntries = sourceLevel == 1 ? root->l1Entries : root->l2Entries;
+      if (count <= 0)
+      {
+         levelCompacting[sourceLevel] = false;
+         return;
+      }
+      u32 batchSize = min<u32>(4, count);
+      u64 min, max;
+      for (u16 i = 0; i < batchSize; i++)
+      {
+         if (i == 0) {min = sourceEntries[i].minKey; max = sourceEntries[i].maxKey;}
+         sourceVictims.push_back(sourceEntries[i].fileID);
+         if (sourceEntries[i].minKey < min) min = sourceEntries[i].minKey;
+         if (sourceEntries[i].maxKey > max) max = sourceEntries[i].maxKey;
+      }
+      u32 destCount = destLevel == 2 ? root->l2_count : root->l3_count;
+      Level0Entry* destEntries = destLevel == 2 ? root->l2Entries : root->l3Entries;
+      if (destEntries)
+      {
+         for (u32 i = 0; i < destCount; i++)
+         {
+            u64 minKey = destEntries[i].minKey;
+            u64 maxKey = destEntries[i].maxKey;
+            if (!(maxKey < min || minKey > max))
+            {
+               overlapping.push_back(destEntries[i].fileID);
+            }
+         }
+      }
+   }
+   if (sourceVictims.empty()) return;
+   vector<u64> filesToMerge =sourceVictims;
+   filesToMerge.insert(filesToMerge.end(), overlapping.begin(), overlapping.end());
+   vector<SSTableMetadata> results = mergeOverlapping(filesToMerge, destLevel);
+   updateTables(sourceLevel, sourceVictims, destLevel, overlapping, results);
+
+   {
+      unique_lock lock(readerMutex);
+      for (u64 oldID : filesToMerge)
+      {
+         readerCache.erase(oldID);
+      }
+   }
+   for (u64 oldID : filesToMerge)
+   {
+      string path = "/tmp/sstables/" + to_string(oldID) + ".sst";
+      if (unlink(path.c_str()) != 0)
+      {
+         if (errno != ENOENT) cout << ("unlink failed");
+      }
+      cout<< path + "deleted from l1" << endl;
+   }
+   levelCompacting[sourceLevel] = false;
+}
+
 template<class Fn>
 bool LsmTree::lookup(span<u8> key, Fn fn)
 {
+   u64 keyInt = 0;
+   memcpy(&keyInt, key.data(), min(key.size(), sizeof(u64)));
+   keyInt = __builtin_bswap64(keyInt);
    string keyStr(reinterpret_cast<const char*>(key.data()), key.size());
    {                                                    // check memtable
       lock_guard<mutex> lock(memtableMutex);
@@ -2261,51 +2530,39 @@ bool LsmTree::lookup(span<u8> key, Fn fn)
       GuardS<LsmRootPage> root(LSM_ROOT_ID);
       for (int i = (int)root->l0_count - 1; i >= 0; i--)
       {
-         string_view min(root->l0Entries[i].minKey);
-         string_view max(root->l0Entries[i].maxKey);
-         if (keyStr >= min && keyStr <= max)
+         u64 min = root->l0Entries[i].minKey;
+         u64 max = root->l0Entries[i].maxKey;
+         if (keyInt >= min && keyInt <= max)
          {
             candidateFiles.push_back(root->l0Entries[i].fileID);
          }
       }
-   }
-   for (u64 fileID : candidateFiles)
-   {
-      try
+
+      for (u64 fileID : candidateFiles)
       {
-         auto reader = getReader(fileID);
-         if (reader->lookup(key,fn)) return true;
-      } catch (...)
-      {
-         continue;
-      }
-   }
-   vector<u64> l1candidateFiles;
-   {
-      GuardS<LsmRootPage> root(LSM_ROOT_ID);
-      for (u32 i = 0; i < root->l1_count; i++)
-      {
-         string_view min(root->l1Entries[i].minKey);
-         string_view max(root->l1Entries[i].maxKey);
-         if (keyStr >= min && keyStr <= max)
+         try
          {
-            l1candidateFiles.push_back(root->l1Entries[i].fileID);
+            auto reader = getReader(fileID);
+            if (reader->lookup(key,fn)) return true;
+         } catch (...)
+         {
+            continue;
          }
       }
-   }
-   for (u64 fileID : l1candidateFiles)
-   {
-      try
+      auto checkLevel = [&](u32 count, Level0Entry* entries) -> u64
       {
-         auto reader = getReader(fileID);
-         if (reader->lookup(key,fn)) return true;
-      }
-      catch (...)
-      {
-         continue;
-      }
+         for (u32 i = 0; i < count; i++)
+         {
+            if (keyInt >= entries[i].minKey && keyInt <= entries[i].maxKey) return entries[i].fileID;
+         }
+         return 0;
+      };
+      u64 id;
+      if ((id = checkLevel(root->l1_count, root->l1Entries))) if (getReader(id)->lookup(key, fn)) return true;
+      if ((id = checkLevel(root->l2_count, root->l2Entries))) if (getReader(id)->lookup(key, fn)) return true;
+      if ((id = checkLevel(root->l3_count, root->l3Entries))) if (getReader(id)->lookup(key, fn)) return true;
    }
-   return dummy.lookup(key, fn);
+   return false;
 }
 
 bool LsmTree::remove(span<u8> key)
@@ -2341,7 +2598,6 @@ bool LsmTree::remove(span<u8> key)
             memtable.emplace(move(keyStr), MemtableEntry(empty_payload, true));
          }
          memtableSize += entry_size;
-         dummy.remove(key);
          return true; // Success, exit infinite loop
       }
       catch (const OLCRestartException&)
@@ -2649,6 +2905,7 @@ int main(int argc, char** argv) {
    auto systemName = bm.useExmap ? "exmap" : "vmcache";
 
    auto statFn = [&]() {
+      std::cout << "RootPage size: " << sizeof(LsmRootPage) << " bytes" << std::endl;   // TODO : remove
       cout << "ts,tx,rmb,wmb,system,threads,datasize,workload,batch" << endl;
       u64 cnt = 0;
       for (uint64_t i=0; i<runForSec; i++) {
