@@ -1886,6 +1886,8 @@ private:
    shared_mutex readerMutex;
    shared_ptr<SSTableReader> getReader(u64 fileID);
 
+   mutex updateMutexes[1024]; // for updatInPlace to lock the mutex of the hash of the key, we can't just mmake a mutex for each key as they would be a lot
+
    void flush();// flushing the memtable to immutable tables queue
    vector<SSTableMetadata> mergeOverlapping(const vector<u64>& filesToMerge, u16 targetLvl);
    void applyMerge(u32* count, Level0Entry* entries, const vector<u64>& toRemove, const vector<SSTableMetadata>& toAdd, u32 maxCap);
@@ -1974,7 +1976,12 @@ shared_ptr<SSTableReader> LsmTree::getReader(u64 fileID)   // returns a reader f
 
 template <class Fn>
 bool LsmTree::updateInPlace(span<u8> key, Fn fn)  // find the value and insert the updated value, no such thing as an update in place in an lsm tree
-{
+{     // we need to lock the specific entry while doing this, so this function is thread safe
+      // we can't have a separate mutex for each key, but we can hash the key. we have 1024 buckets s oit is improbable they collide
+   string_view view = (key.data(),key.size());
+   size_t bucket = hash<string_view>{}(view) % 1024;   // use c++ included hash
+   lock_guard<mutex> updateLock(updateMutexes[bucket]);   // if already taken, thread will wait here
+
    u8 buffer[SSTABLE_BLOCK_SIZE];
    u16 payloadLen;
    bool found = false;
