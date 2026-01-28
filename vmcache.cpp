@@ -30,7 +30,6 @@
 
 #include "exmap.h"
 
-struct SSTableIterator;
 __thread uint16_t workerThreadId = 0;
 __thread int32_t tpcchistorycounter = 0;
 #include "tpcc/TPCCWorkload.hpp"
@@ -291,6 +290,7 @@ struct BufferManager {
 
    atomic<u64> readCount;
    atomic<u64> writeCount;
+   atomic<u64> lsmSize;
 
    Page* virtMem;
    PageState* pageState;
@@ -641,6 +641,7 @@ BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envO
    allocCount = 1; // pid 0 reserved for meta data
    readCount = 0;
    writeCount = 0;
+   lsmSize = 0;
    batch = envOr("BATCH", 64);
 
    cerr << "vmcache " << "blk:" << path << " virtgb:" << virtSize/gb << " physgb:" << physSize/gb << " exmap:" << useExmap << endl;
@@ -1298,15 +1299,15 @@ struct BTreeNode : public BTreeNodeHeader {
 };
 
 
-struct Level0Entry
-{
+struct Level0Entry  // store min and max key for each file so we don't have to open them to check if the key can be inside
+{                   // basically a manifest entry cause all level entryies are the same
    u64 fileID;
    u64 minKey;
    u64 maxKey;
 };
 
-struct LsmRootPage
-{
+struct LsmRootPage   // max 4096 bytes, after that it does not fit on one page, could split into multiple pages for more capacity
+{                    // level0entry has size 24B so we can fit 168 file entries, set it to 150, so first level has 10 and size ratio is 2
    bool dirty;
    u64 nextSSTableId;
    static constexpr u32 L0_COMPACTION_TRIGGER = 4;
@@ -1441,13 +1442,19 @@ struct BTree {
    }
 
    template<class Fn>
-   void scanAsc(span<u8> key, Fn fn) {
+   void scanAsc(span<u8> key, Fn fn) {     // modified to use fn with span, like lsm tree
       GuardS<BTreeNode> node = findLeafS(key);
       bool found;
       unsigned pos = node->lowerBound(key, found);
+      u8 keyBuffer[pageSize];
       for (u64 repeatCounter=0; ; repeatCounter++) { // XXX
          if (pos<node->count) {
-            if (!fn(*node.ptr, pos))
+            unsigned len = node->prefixLen + node->slot[pos].keyLen;
+            memcpy(keyBuffer, node->getPrefix(), node->prefixLen);
+            memcpy(keyBuffer + node->prefixLen, node->getKey(pos), node->slot[pos].keyLen);
+            span<u8> keySpan(keyBuffer, len);
+            span<u8> payloadSpan = node->getPayload(pos);
+            if (!fn(keySpan, payloadSpan))
                return;
             pos++;
          } else {
@@ -1460,7 +1467,7 @@ struct BTree {
    }
 
    template<class Fn>
-   void scanDesc(span<u8> key, Fn fn) {
+   void scanDesc(span<u8> key, Fn fn) {    // also modified so it matches lsm tree
       GuardS<BTreeNode> node = findLeafS(key);
       bool exactMatch;
       int pos = node->lowerBound(key, exactMatch);
@@ -1468,9 +1475,15 @@ struct BTree {
          pos--;
          exactMatch = true; // XXX:
       }
+      u8 keyBuffer[pageSize];
       for (u64 repeatCounter=0; ; repeatCounter++) { // XXX
          while (pos>=0) {
-            if (!fn(*node.ptr, pos, exactMatch))
+            unsigned len = node->prefixLen + node->slot[pos].keyLen;
+            memcpy(keyBuffer, node->getPrefix(), node->prefixLen);
+            memcpy(keyBuffer + node->prefixLen, node->getKey(pos), node->slot[pos].keyLen);
+            span<u8> keySpan(keyBuffer, len);
+            span<u8> payloadSpan = node->getPayload(pos);
+            if (!fn(keySpan, payloadSpan))
                return;
             pos--;
          }
@@ -1494,29 +1507,27 @@ struct MemtableEntry
    payload(reinterpret_cast<const char*>(payload_span.data()), payload_span.size()) {};
    MemtableEntry() = default;
 };
-using Memtable = map<string, MemtableEntry>;
+using Memtable = map<string, MemtableEntry>;   // we use a map as the memtable since it stores data sorted after the keys
 
-struct SSTableMetadata
+struct SSTableMetadata   // we will store metadata of an sstable on the first block of the sstable, so we know how to read the file
 {
    u64 fileID;
    u32 level;
-   string minKey;
+   string minKey;   // to know the key ranges of an sstable for lookup
    string maxKey;
-   u64 blockIndexOffset;
+   u64 blockIndexOffset;  // the offset of where the indexes are and how many they are
    u32 numBlocks;
-   u64 bloomFilterOffset;
-   u32 bloomFilterSize;
 
 };
-constexpr u32 SSTABLE_BLOCK_SIZE = 4096;
+constexpr u32 SSTABLE_BLOCK_SIZE = 4096;  // same as page size
 
 struct BlockIndexEntry
 {
-   string lastKey;
-   u64 blockOffset;     // to access the data of the block
+   string lastKey;   // store the last key of each block (the biggest)
+   u64 blockOffset;  // and where it starts
 };
 
-class Serializer
+class Serializer   // helper to serialize data
 {
 private:
    u8* buffer;
@@ -1532,7 +1543,6 @@ public:
    void writeKey(const string& key)
    {
       u16 len = key.size();
-      if (len > 256) {assert(len <= 256);}
       write(len);
       memcpy(buffer+offset, key.data(), len);
       offset += len;
@@ -1555,20 +1565,20 @@ private:
    string lastKeyInBlock = "";
    string firstKeyInTable = "";
    u64 currentBlockSize = 0;
-   u64 blockOffset1 = SSTABLE_BLOCK_SIZE;  // first block is for metadata
+   u64 blockOffset1 = SSTABLE_BLOCK_SIZE;  // first block is for metadata so we don't start from 0
    void writeBlock(const u8* data, u64 size);
    void writeIndexAndMetadata(SSTableMetadata& metadata);
    u64 getRecordSize(const string& key, const MemtableEntry& entry);
    u64 serializeRecord(u8* buffer, u64 currentPosition, const string& key, const MemtableEntry& entry);
 public:
-   explicit SSTableWriter (u64 FileID, const string& directory = "/tmp/sstables")    // set up the location where sstables will be store on disk
-      : currentOffset(SSTABLE_BLOCK_SIZE)  // saving first block for metadata
+   explicit SSTableWriter (u64 FileID, const string& directory = "/tmp/sstables")    // all sstables will be stored in /tmp/sstables and will be called fileId.sst
+      : currentOffset(SSTABLE_BLOCK_SIZE)                                               // fileId will be unique
    {
       fileID = FileID;
       string path = directory + "/" + to_string(FileID) + ".sst";
       mkdir(directory.c_str(), 0777);
-      fileFD = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_DIRECT, 0644);
-      if (fileFD < 0)
+      fileFD = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_DIRECT, 0644);  // O_DIRECT to bypass OS page cache,
+      if (fileFD < 0)                                                                     // o_trunc so in case we use the same id more times we just wipe the older file (should not happen, but to be safe)
       {
          throw runtime_error("Failed to  open (for writer) sstable file " + path);
       }
@@ -1587,12 +1597,12 @@ public:
    void addRecord(string_view key, string_view payload, bool isTombstone);
    void finish(SSTableMetadata& metadata);
 };
-// get size of memtable entry
+// get size of memtable entry including key
 u64 SSTableWriter::getRecordSize(const string& key, const MemtableEntry& entry)
 {
    return sizeof(u16) + key.size() + sizeof(u16) + entry.payload.size() + sizeof(u8);
 }
-   // serialize a memtableEntry in the buffer
+   // serialize a memtableEntry in the buffer at the given position
 u64 SSTableWriter::serializeRecord(u8* buffer, u64 currentPosition, const string& key, const MemtableEntry& entry)
 {
    u8* start = buffer + currentPosition;
@@ -1612,7 +1622,7 @@ u64 SSTableWriter::serializeRecord(u8* buffer, u64 currentPosition, const string
    ptr += sizeof(u8);
    return static_cast<u64>(ptr - start);   // return size of the write
 }
-   // write a block to the file
+   // write a block to the file (to disk)
 void SSTableWriter::writeBlock(const u8* data, u64 size)
 {
    assert(currentOffset % SSTABLE_BLOCK_SIZE == 0);
@@ -1620,9 +1630,11 @@ void SSTableWriter::writeBlock(const u8* data, u64 size)
    memcpy(paddedBlock.data(), data, size);
    ssize_t result = pwrite(fileFD, paddedBlock.data(), SSTABLE_BLOCK_SIZE, currentOffset);
    assert(result == SSTABLE_BLOCK_SIZE);
+   bm.writeCount.fetch_add(1);  // for wmb benchmark
+   bm.lsmSize.fetch_add(SSTABLE_BLOCK_SIZE); // for size benchmark
    currentOffset += SSTABLE_BLOCK_SIZE;
 }
-
+  // writes index entries at the end of the file and metadata of the sstable in the first reserve block (offset 0)
 void SSTableWriter::writeIndexAndMetadata(SSTableMetadata& metadata)
 {
    metadata.blockIndexOffset = currentOffset;
@@ -1631,7 +1643,7 @@ void SSTableWriter::writeIndexAndMetadata(SSTableMetadata& metadata)
    fill(blockBuffer.begin(), blockBuffer.end(), 0);
    for (const auto& entry : blockIndex) // write the index to disk, as many entries per block as we can fit
    {
-      if (indexSize + getRecordSize(entry.lastKey, {}) > SSTABLE_BLOCK_SIZE)
+      if (indexSize + getRecordSize(entry.lastKey, {}) > SSTABLE_BLOCK_SIZE) //if next entry doesn't fit, write the buffer to disk
       {
          writeBlock(blockBuffer.data(), indexSize);
          indexSize = 0;
@@ -1647,22 +1659,22 @@ void SSTableWriter::writeIndexAndMetadata(SSTableMetadata& metadata)
       ptr += sizeof(u64);
       indexSize += sizeof(u64) + sizeof(u16) + keyLen;
    }
-   if (indexSize > 0)
+   if (indexSize > 0) // write last block to disk
    {
       writeBlock(blockBuffer.data(), indexSize);
    }
    fill(blockBuffer.begin(), blockBuffer.end(), 0);
-   Serializer metaSerializer(blockBuffer.data());
+   Serializer metaSerializer(blockBuffer.data()); // write metadata
    metaSerializer.write(metadata.fileID);
    metaSerializer.write(metadata.level);
    metaSerializer.writeKey(metadata.minKey);
    metaSerializer.writeKey(metadata.maxKey);
    metaSerializer.write(metadata.blockIndexOffset);
    metaSerializer.write(metadata.numBlocks);
-   metaSerializer.write(metadata.bloomFilterOffset);
-   metaSerializer.write((metadata.bloomFilterSize));
-   ssize_t result = pwrite(fileFD, blockBuffer.data(), SSTABLE_BLOCK_SIZE, 0);
+   ssize_t result = pwrite(fileFD, blockBuffer.data(), SSTABLE_BLOCK_SIZE, 0); // write it to disk at the beginning of the file
    assert(result == SSTABLE_BLOCK_SIZE);
+   bm.writeCount.fetch_add(1);   // for wmb benchmark
+   bm.lsmSize.fetch_add(SSTABLE_BLOCK_SIZE);  // for size benchmark
    close(fileFD);
 }
 
@@ -1675,27 +1687,28 @@ private:
    u8* blockBuffer;
 
 public:
-   SSTableReader(u64 fileID, const string& dir = "/tmp/sstables" )
+   SSTableReader(u64 fileID, const string& dir = "/tmp/sstables" )  // opens file fileID to read from it
    {
       string path = dir + "/" + to_string(fileID) + ".sst";
       fd = open(path.c_str(), O_RDONLY | O_DIRECT);
       if (fd < 0) throw std::runtime_error("Failed to open (for reader) sst file " + path);
       blockBuffer = (u8*)aligned_alloc(4096, 4096);
-      if (pread(fd, blockBuffer, 4096, 0) != 4096) throw std::runtime_error("Failed to read sst file " + path);
+      if (pread(fd, blockBuffer, 4096, 0) != 4096) throw std::runtime_error("Failed to read sst file " + path); // read first block (metadata)
+      bm.readCount.fetch_add(1);  // for rmb benchmark
       u8* ptr = blockBuffer;
-      memcpy(&metadata.fileID, ptr, sizeof(u64)); ptr += sizeof(u64);
+      memcpy(&metadata.fileID, ptr, sizeof(u64)); ptr += sizeof(u64); // fill metadata with the metadata from file
       memcpy(&metadata.level, ptr, sizeof(u32)); ptr += sizeof(u32);
       auto readString = [&](string& str)
       {
          u16 len;
-         memcpy(&len, ptr, sizeof(u16)); ptr += sizeof(u16);
-         str.assign((char*) ptr, len); ptr += len;
+         memcpy(&len, ptr, sizeof(u16)); ptr += sizeof(u16);  // read length and store it in len
+         str.assign((char*) ptr, len); ptr += len;  // read the string of length len and store it in the referance parameter
       };
       readString(metadata.minKey);
       readString(metadata.maxKey);
       memcpy(&metadata.blockIndexOffset, ptr, sizeof(u64)); ptr += sizeof(u64);
       memcpy(&metadata.numBlocks, ptr, sizeof(u32)); ptr += sizeof(u32);
-      loadIndex();
+      loadIndex();  // read index
    }
    ~SSTableReader()
    {
@@ -1704,20 +1717,21 @@ public:
    }
    void loadIndex();
    template<class Fn>
-   bool lookup(span<u8> key, Fn fn)
-   { // efficient binary search
+   int lookup(span<u8> key, Fn fn)       // returns 0 if not in sstable, 1 if in sstable but is tombstone, 2 if in sstable and not tombstone
+   { // efficient binary search for the first block in which key could be
       auto it = lower_bound(index.begin(), index.end(), key, [](const BlockIndexEntry& entry, span<u8> k)
-      {
+      {    // it points to the first element bigger than key, because we need the lastKey of the block to be bigger than the key since sstable are sorted
          string_view entryKey(entry.lastKey);
          string_view searchKey((char*)k.data(), k.size());
          return entryKey < searchKey;  // this comparator is used to eliminate the invalid options, that is why it looks like it is the wrong way around
       });
-      if (it == index.end()) return false;
-      if (pread(fd, blockBuffer, SSTABLE_BLOCK_SIZE, it->blockOffset) != SSTABLE_BLOCK_SIZE) return false; // read the candidate block
+      if (it == index.end()) return 0;
+      if (pread(fd, blockBuffer, SSTABLE_BLOCK_SIZE, it->blockOffset) != SSTABLE_BLOCK_SIZE) return 0; // read the candidate block
+      bm.readCount.fetch_add(1);  // for rmb benchmark
       u64 offset = 0;
-      while (offset < SSTABLE_BLOCK_SIZE)
+      while (offset < SSTABLE_BLOCK_SIZE)  // blocks are small, we just iterate through until we find key
       {
-         u16 keyLen;
+         u16 keyLen;   // read key, payload and isTombstone
          memcpy(&keyLen, blockBuffer + offset, sizeof(u16));
          if (keyLen == 0) break;
          u8* keyPtr = blockBuffer + offset + sizeof(u16);
@@ -1727,13 +1741,13 @@ public:
          u8 isTombstone = *(payloadPtr + payloadLen);
          if (keyLen == key.size() && memcmp(keyPtr, key.data(), keyLen) == 0)
          {
-            if (isTombstone) return true;
+            if (isTombstone) return 1;  // it has been deleted but we did find it
             fn(span<u8>(payloadPtr, payloadLen));
-            return true;
+            return 2;
          }
          offset += sizeof(u16) + keyLen + sizeof(u16) + payloadLen + sizeof(u8);
       }
-      return false;
+      return 0;
    }
    int const getFd() const {return fd;}
    const SSTableMetadata& getMetadata() const {return metadata;}
@@ -1750,8 +1764,9 @@ void SSTableReader::loadIndex()
    while (index.size() < metadata.numBlocks )   // read 4kb chunks until there are no more blockIndexEntries
    {
       if (pread(fd, blockBuffer, SSTABLE_BLOCK_SIZE, currentOffset) != SSTABLE_BLOCK_SIZE) break;
+      bm.readCount.fetch_add(1);  // for rmb benchmark;
       u64 bufferOffset = 0;
-      while (bufferOffset < SSTABLE_BLOCK_SIZE && index.size() < metadata.numBlocks)
+      while (bufferOffset < SSTABLE_BLOCK_SIZE && index.size() < metadata.numBlocks)  // add entries into index from the block we read
       {
          u16 len;
          memcpy(&len, blockBuffer + bufferOffset, sizeof(u16));
@@ -1764,11 +1779,11 @@ void SSTableReader::loadIndex()
          bufferOffset += sizeof(u64);
          index.push_back(move(entry));
       }
-      currentOffset += SSTABLE_BLOCK_SIZE;
+      currentOffset += SSTABLE_BLOCK_SIZE;  // go to next block
    }
 }
 
-struct SSTableIterator
+struct SSTableIterator   // used to iterate through an sstable, entry by entry, loading a block at a time
 {
    shared_ptr<SSTableReader> reader;
    u8* buffer;
@@ -1782,11 +1797,11 @@ struct SSTableIterator
    SSTableIterator(shared_ptr<SSTableReader> reader) : reader(reader)
    {
       buffer = (u8*)aligned_alloc(4096, SSTABLE_BLOCK_SIZE);
-      loadBlock(0);
+      loadBlock(0);  // load first block of entries
    }
    ~SSTableIterator() { free(buffer); }
 
-   void loadBlock(u64 blockIndex)  // load the next block in the sstable
+   void loadBlock(u64 blockIndex)  // load the next block of the sstable
    {
       if (blockIndex >= reader->getMetadata().numBlocks)
       {
@@ -1794,11 +1809,12 @@ struct SSTableIterator
          return ;
       }
       u64 off = reader->getBlockOffset(blockIndex);
-      if (pread(reader->getFd(), buffer, 4096, off) != 4096)
+      if (pread(reader->getFd(), buffer, 4096, off) != 4096)  // read block
       {
          cont = false;
          return ;
       }
+      bm.readCount.fetch_add(1);  // for rmb benchmark
       currentBlockIndex = blockIndex;
       offsetInBlock = 0;
       cont = true;
@@ -1807,7 +1823,7 @@ struct SSTableIterator
    bool next()
    {
       if (!cont) return false;
-      if (offsetInBlock + sizeof(u16) > SSTABLE_BLOCK_SIZE)
+      if (offsetInBlock + sizeof(u16) > SSTABLE_BLOCK_SIZE)  // no space left in block even for the length of the key
       {
          loadBlock(currentBlockIndex + 1);
          return cont;
@@ -1815,7 +1831,7 @@ struct SSTableIterator
       u16 keyLen;
       memcpy(&keyLen, buffer + offsetInBlock, sizeof(u16));
       u64 size = sizeof(u16) + keyLen + sizeof(u16);
-      if (keyLen == 0 || offsetInBlock + size > SSTABLE_BLOCK_SIZE)  // end of block;
+      if (keyLen == 0 || offsetInBlock + size > SSTABLE_BLOCK_SIZE)  // check if safe to read
       {
          loadBlock(currentBlockIndex + 1);
          return cont;
@@ -1823,13 +1839,13 @@ struct SSTableIterator
       u8* keyPtr = buffer + offsetInBlock + sizeof(u16);
       u16 payloadLen;
       memcpy(&payloadLen, keyPtr + keyLen, sizeof(u16));
-      if (offsetInBlock + size + payloadLen + sizeof(u8) > SSTABLE_BLOCK_SIZE)
+      if (offsetInBlock + size + payloadLen + sizeof(u8) > SSTABLE_BLOCK_SIZE) // check if safe to read
       {
          loadBlock(currentBlockIndex + 1);
          return cont;
       }
       u8* payloadPtr = keyPtr + keyLen + sizeof(u16);
-      key = string_view((char*)keyPtr, keyLen);
+      key = string_view((char*)keyPtr, keyLen);         // read key, payload and tombstone
       payload = string_view((char*)payloadPtr, payloadLen);
       isTombstone = *(payloadPtr + payloadLen);
       offsetInBlock += payloadLen + keyLen + sizeof(u16) + sizeof(u16) + sizeof(u8); // move to next entry in block
@@ -1837,22 +1853,15 @@ struct SSTableIterator
    }
 };
 
-struct MergeIteratorEntry
+struct MergeIteratorEntry   // a struct holding an iterator and a fileID so we can sort the iterators based on the id, so
 {
    SSTableIterator* it;
    u64 fileID;
    bool operator>(const MergeIteratorEntry& other) const  // sort keys ascending
    {
       if (it->key != other.it->key) return it->key > other.it->key;
-      return fileID < other.fileID;
+      return fileID < other.fileID;  // secondary sort id descending (higher id first)
    }
-};
-
-struct Compaction
-{
-   u16 sourceLevel;
-   vector<u64> sourceFiles;
-   vector<u64> destFiles;
 };
 
 
@@ -1861,23 +1870,22 @@ struct LsmTree
 {
 private:
    static constexpr u64 LSM_ROOT_ID = 1;
-   static constexpr size_t MEMTABLE_CAPACITY = 64 * 1024 * 1024;
+   static constexpr size_t MEMTABLE_CAPACITY = 64 * 1024 * 1024;  // also approximately size of sstable
    Memtable memtable;
    mutex memtableMutex;
    atomic<size_t> memtableSize{0};
    vector<Memtable> immutableMemtables;
    mutex immutableMemtablesMutex;
-   atomic<bool> levelCompacting[3] = {false, false, false};
+   atomic<bool> levelCompacting[3] = {false, false, false};  // atomic flags to make sure only one compaction per level happens at a time
    thread flusherThread;
    condition_variable flusherCond;
    atomic<bool> shutDown{false};
-   void backgroundFlush();
+   void backgroundFlush();  // writes sstables to L0 and triggers L0 compaction when necessary
 
-   unordered_map<u64, shared_ptr<SSTableReader>> readerCache;
+   unordered_map<u64, shared_ptr<SSTableReader>> readerCache;  // we keep readers so we don't create new ones all the time
    shared_mutex readerMutex;
    shared_ptr<SSTableReader> getReader(u64 fileID);
 
-   BTree dummy;
    void flush();// flushing the memtable to immutable tables queue
    vector<SSTableMetadata> mergeOverlapping(const vector<u64>& filesToMerge, u16 targetLvl);
    void applyMerge(u32* count, Level0Entry* entries, const vector<u64>& toRemove, const vector<SSTableMetadata>& toAdd, u32 maxCap);
@@ -1891,8 +1899,7 @@ public:
 
    LsmTree() : splitOrdered(false)
    {
-      slotId = dummy.slotId;
-      call_once(lsmFlag, []
+      call_once(lsmFlag, []  // this only runs once, so the initialization is not done multiple times by different threads
       {
          GuardX<MetaDataPage> meta(0);
          if (meta->lsmRootPid == 0)
@@ -1909,19 +1916,19 @@ public:
          GuardS<MetaDataPage> meta(0);
          this->rootPageId = meta->lsmRootPid;
          GuardX<LsmRootPage> root(this->rootPageId);
-         if (root->nextSSTableId == 0 || root->nextSSTableId > 1000000ull)
+         if (root->nextSSTableId == 0)    // set counter to 1 if counter is not already stored on disk from a previous run
          {
             root->nextSSTableId = 1;
             root->dirty = true;
          }
       }
-      flusherThread = std::thread(&LsmTree::backgroundFlush, this);
+      flusherThread = std::thread(&LsmTree::backgroundFlush, this);  // start the background thread used for flushing to disk and compacting
    }
    ~LsmTree()
    {
       shutDown = true;
       flusherCond.notify_all();
-      if (flusherThread.joinable()) flusherThread.join();
+      if (flusherThread.joinable()) flusherThread.join(); // wait for it to finish before shut down
    }
    void compactLevel(u16 sourceLevel);
    static u64 getFileId();
@@ -1930,22 +1937,16 @@ public:
    bool lookup(span<u8> key, Fn fn);
    bool remove(span<u8> key);
    template<class Fn>
-   void scanAsc(span<u8> key, Fn fn)
-   {
-      dummy.scanAsc(key, fn);
-   }
+   void scanAsc(span<u8> key, Fn fn);
    template<class Fn>
    void scanDesc(span<u8> key, Fn fn)
    {
-      dummy.scanDesc(key, fn);
+      return; // very inefficient so skip implementation, even worse than scanAsc
    }
    template<class Fn>
-   bool updateInPlace(span<u8> key, Fn fn)
-   {
-      return dummy.updateInPlace(key, fn);
-   }
+   bool updateInPlace(span<u8> key, Fn fn);
 };
-u64 LsmTree::getFileId()
+u64 LsmTree::getFileId()   // returns a new unique fileID and increments it
 {
    GuardX<LsmRootPage> root(LSM_ROOT_ID);
    u64 id =  root->nextSSTableId++;
@@ -1953,9 +1954,7 @@ u64 LsmTree::getFileId()
    return id;
 }
 
-
-
-shared_ptr<SSTableReader> LsmTree::getReader(u64 fileID)
+shared_ptr<SSTableReader> LsmTree::getReader(u64 fileID)   // returns a reader for fileID (if there isn't one in cache it creates one)
 {
    {
       shared_lock lock(readerMutex);   // faster if it is in cache
@@ -1966,11 +1965,30 @@ shared_ptr<SSTableReader> LsmTree::getReader(u64 fileID)
       unique_lock lock(readerMutex);
       auto it = readerCache.find(fileID);
       if (it != readerCache.end()) return it->second;  // check again
-      auto reader = make_shared<SSTableReader>(fileID);
+      auto reader = make_shared<SSTableReader>(fileID); // not in cache so create new one and also put it in cache
       readerCache[fileID] = reader;
       return reader;
    }
 
+}
+
+template <class Fn>
+bool LsmTree::updateInPlace(span<u8> key, Fn fn)  // find the value and insert the updated value, no such thing as an update in place in an lsm tree
+{
+   u8 buffer[SSTABLE_BLOCK_SIZE];
+   u16 payloadLen;
+   bool found = false;
+   this->lookup(key, [&](span<u8> payload)
+   {
+      if (payload.size() > SSTABLE_BLOCK_SIZE) return; // exists, but found stays false because payload is too big
+      memcpy(buffer, payload.data(), payload.size());
+      payloadLen = payload.size();
+      found = true;  // this function doesn't run if we find it but is tombstone, if it is tombstone we don't want to update it anyway
+   });
+   if (!found) return false;
+   fn(span<u8>(buffer, payloadLen));   // if found we apply the function and insert it
+   this->insert(key, {buffer, payloadLen});
+   return true;
 }
 
 
@@ -1978,10 +1996,10 @@ SSTableMetadata SSTableWriter::writeMemtable(Memtable& memtable, u8 targetLevel)
 {
    assert(fileFD > 0);
    SSTableMetadata metadata = {};
-   metadata.level = targetLevel;
+   metadata.level = targetLevel;   // we return the metadata of the newly created sstable at the end
    metadata.fileID = this->fileID;
    memset(blockBuffer.data(), 0, SSTABLE_BLOCK_SIZE);
-   for (auto& [key, entry] : memtable)
+   for (auto& [key, entry] : memtable)  // we take every entry
    {
       if (firstKeyInTable.empty())
       {
@@ -1989,8 +2007,8 @@ SSTableMetadata SSTableWriter::writeMemtable(Memtable& memtable, u8 targetLevel)
       }
       if (currentBlockSize + getRecordSize(key, entry) > SSTABLE_BLOCK_SIZE)   // check if entry fits in block
       {
-         blockIndex.push_back({.lastKey = lastKeyInBlock, .blockOffset = blockOffset1});
-         writeBlock(blockBuffer.data(), currentBlockSize);
+         blockIndex.push_back({.lastKey = lastKeyInBlock, .blockOffset = blockOffset1});  // we store the offset and the alstKey for the blockIndex
+         writeBlock(blockBuffer.data(), currentBlockSize);  // we write the block to disk and reset for the next block
          blockOffset1 = currentOffset;
          currentBlockSize = 0;
          memset(blockBuffer.data(), 0, SSTABLE_BLOCK_SIZE);
@@ -2003,37 +2021,37 @@ SSTableMetadata SSTableWriter::writeMemtable(Memtable& memtable, u8 targetLevel)
       blockIndex.push_back({.lastKey = lastKeyInBlock, .blockOffset = blockOffset1});
       writeBlock(blockBuffer.data(), currentBlockSize);
    }
-   metadata.minKey = firstKeyInTable;
+   metadata.minKey = firstKeyInTable;  // finish metadata and write it at the start of the sstable
    metadata.maxKey = lastKeyInBlock;
    writeIndexAndMetadata(metadata);
    return metadata;
 }
 
-void SSTableWriter::addRecord(string_view key, string_view payload, bool isTombstone)
+void SSTableWriter::addRecord(string_view key, string_view payload, bool isTombstone)   // just like writeMemtable but is used to add just one entry in an sstable
 {
    if (firstKeyInTable.empty()) fill(blockBuffer.begin(), blockBuffer.end(), 0);
    u16 keyLen = key.size();
    u16 payloadLen = payload.size();
    u64 size = sizeof(u16) + keyLen + payloadLen + sizeof(u16) + sizeof(u8);
-   if (currentBlockSize + size > SSTABLE_BLOCK_SIZE)
+   if (currentBlockSize + size > SSTABLE_BLOCK_SIZE)  // check if entry will fit in buffer
    {
       blockIndex.push_back({lastKeyInBlock, blockOffset1});
-      writeBlock(blockBuffer.data(), currentBlockSize);
+      writeBlock(blockBuffer.data(), currentBlockSize);  // write buffer to disk and reset
       blockOffset1 = currentOffset;
       currentBlockSize = 0;
       fill(blockBuffer.begin(), blockBuffer.end(), 0);
    }
-   u8* ptr = blockBuffer.data() + currentBlockSize;
-   memcpy(ptr, &keyLen, sizeof(u16)); ptr += sizeof(u16);
+   u8* ptr = blockBuffer.data() + currentBlockSize; // currentBlockSize is also the offset in the block where we write
+   memcpy(ptr, &keyLen, sizeof(u16)); ptr += sizeof(u16);   // put the entry in the buffer
    memcpy(ptr, key.data(), keyLen); ptr += keyLen;
    memcpy(ptr, &payloadLen, sizeof(u16)); ptr += sizeof(u16);
    memcpy(ptr, payload.data(), payloadLen); ptr += payloadLen;
    *ptr = (u8)isTombstone;
    currentBlockSize += size;
-   lastKeyInBlock = string(key);
+   lastKeyInBlock = string(key);   // update last key
    if (firstKeyInTable.empty()) firstKeyInTable = lastKeyInBlock;
 }
-void SSTableWriter::finish(SSTableMetadata& metadata)
+void SSTableWriter::finish(SSTableMetadata& metadata)  // writes current block and then index and metadata
 {
    if (currentBlockSize > 0)
    {
@@ -2046,13 +2064,13 @@ void SSTableWriter::finish(SSTableMetadata& metadata)
 }
 
 
-void LsmTree::insert(span<u8> key, span<u8> payload)
+void LsmTree::insert(span<u8> key, span<u8> payload)  // adds an entry in the memtable
 {
-   if (key.size() + payload.size() > SSTABLE_BLOCK_SIZE - 32) // 32 bytes left empty for tombstone, key length, payload length and extra for future
+   if (key.size() + payload.size() > SSTABLE_BLOCK_SIZE - 32) // 32 bytes left empty for tombstone, key length, payload length and some extra
    {
       throw runtime_error("key / payload size too big");
    }
-   for (u64 repeat = 0; ; repeat++) {
+   for (u64 repeat = 0; ; repeat++) { // keep trying to insert until succesful
       try
          {
          string keyStr(reinterpret_cast<const char*>(key.data()), key.size());
@@ -2070,7 +2088,7 @@ void LsmTree::insert(span<u8> key, span<u8> payload)
          if (memtableSize.load() + entry_size > MEMTABLE_CAPACITY)  // if buffer full, flush
          {
             lock.unlock();
-            flush();
+            flush();   // clear memtable, transfering it to an immtable and trigger l0 flush
             throw OLCRestartException();
          }
          if (it != memtable.end())
@@ -2084,7 +2102,7 @@ void LsmTree::insert(span<u8> key, span<u8> payload)
          memtableSize += entry_size;
          return; // Success, exit infinite loop
       }
-      catch (const OLCRestartException&)
+      catch (const OLCRestartException&)  // retry if it was unsuccesful
       {
          yield(repeat);
       }
@@ -2098,56 +2116,57 @@ void LsmTree::flush()
       lock_guard<mutex> active_lock(memtableMutex);
       {
          lock_guard<mutex> immutable_lock(immutableMemtablesMutex);
-         immutableMemtables.push_back(std::move(memtable));
+         immutableMemtables.push_back(std::move(memtable));   // put the memtable in the immtable waiting queue, from where the flusher takes them and turns them into sstables
       }
-      memtable = move(newMemtable);
+      memtable = move(newMemtable);  // reset memtable
       memtableSize = 0;
    }
-   flusherCond.notify_one();
+   flusherCond.notify_one();  // notify the flusher thread there is a new immtable to be flushed to L0
 
 }
 
 void LsmTree::backgroundFlush()
 {
-   workerThreadId = 100;
+   workerThreadId = 100;  // unique id so it doesn't collide with other threads
    while (true)
    {
       Memtable memtableToFlush;
       {
          unique_lock<mutex> lock(immutableMemtablesMutex);
-         flusherCond.wait(lock, [this]
+         flusherCond.wait(
+            lock, [this]      // wait for signal that there is an immtable in the queue or that we are shutting down
          {
             return !immutableMemtables.empty() || shutDown;
          });
-         if (shutDown && immutableMemtables.empty()) break;
+         if (shutDown && immutableMemtables.empty()) break;   // only stops when everything is flushed and shutDown has been signaled
          memtableToFlush = move(immutableMemtables.front());
-         immutableMemtables.erase(immutableMemtables.begin());
+         immutableMemtables.erase(immutableMemtables.begin()); // erase the memtable that we are about to flush from immtables
       }
       if (!memtableToFlush.empty())
       {
-         try
+         try  // in case writer fails
          {
             u64 nextId = getFileId();
             SSTableMetadata metadata;
          {
-            SSTableWriter writer(nextId);
-            metadata = writer.writeMemtable(memtableToFlush, 0);
-         }
+            SSTableWriter writer(nextId);   // unique id for the sstable
+            metadata = writer.writeMemtable(memtableToFlush, 0);   // we write the memtable to disk
+         }  // writer goes out of scope here so the file is closed after this, otherwise it will stay open and we can't unlink it
             bool triggerCompaction = false;
             {
-               GuardX<LsmRootPage> root(LSM_ROOT_ID);
-               if (root->l0_count < LsmRootPage::MAX_L0_FILES)
+               GuardX<LsmRootPage> root(LSM_ROOT_ID);  // lock the root page where manifest is kept
+               if (root->l0_count < LsmRootPage::MAX_L0_FILES)    // update the manifest of the entries of level 0
                {
                   u32 id = root->l0_count++;
                   root->l0Entries[id].fileID = metadata.fileID;
                   u64 minV = 0; u64 maxV = 0;
                   memcpy(&minV, metadata.minKey.data(), min<size_t>(metadata.minKey.size(), sizeof(u64)));
                   memcpy(&maxV, metadata.maxKey.data(), min<size_t>(metadata.maxKey.size(), sizeof(u64)));
-                  root->l0Entries[id].minKey = __builtin_bswap64(minV);
-                  root->l0Entries[id].maxKey = __builtin_bswap64(maxV);
-                  root->dirty = true;
-                  if (root->l0_count >= 5 && !levelCompacting[0].exchange(true))
-                  {
+                  root->l0Entries[id].minKey = __builtin_bswap64(minV);   // we store min and max key as u64 (just the first 8B of the key)
+                  root->l0Entries[id].maxKey = __builtin_bswap64(maxV);   // so lookup doesn't need to open this file if key range doesn't match
+                  root->dirty = true;                                     // we store them in big-endian for correct comparison
+                  if (root->l0_count >= 5 && !levelCompacting[0].exchange(true))   // if a lot of files in l0 we trigger compaction
+                  {                                             // we signal that level 0 is compacting so other threads dont compact at the same time
                      triggerCompaction = true;
                   }
                }
@@ -2155,10 +2174,6 @@ void LsmTree::backgroundFlush()
                if (triggerCompaction)
                {
                   compactL0();
-                  {
-                     GuardS<LsmRootPage> root(LSM_ROOT_ID);
-                     cout<< "L0 count " << root->l0_count << endl;
-                  }
                }
          } catch (const exception& e)
          {
@@ -2169,17 +2184,17 @@ void LsmTree::backgroundFlush()
 }
 
 void LsmTree::compactL0() {
-   vector<u64> l0Files;
-   vector<u64> overlappingL1files;
+   vector<u64> l0Files;   // files to be merged
+   vector<u64> overlappingL1files;   // files to merge with from next level
    u16 mergeNum;
    {
       GuardS<LsmRootPage> root(LSM_ROOT_ID);
-      mergeNum = min<u16>(root->l0_count, 4);
+      mergeNum = min<u16>(root->l0_count, 4);   // batches of max 4 files
       if (mergeNum <= 0) {levelCompacting[0] = false;return;}
-      u64 min, max;
+      u64 min, max;   // [min, max] will be the total key range of the batch]
       for (u16 i = 0; i < mergeNum; i++)
       {
-         if (i ==0) {min = root->l0Entries[0].minKey; max = root->l0Entries[0].maxKey;}
+         if (i == 0) {min = root->l0Entries[0].minKey; max = root->l0Entries[0].maxKey;}
          l0Files.push_back(root->l0Entries[i].fileID);
          if (root->l0Entries[i].minKey < min) min = root->l0Entries[i].minKey;
          if (root->l0Entries[i].maxKey > max) max = root->l0Entries[i].maxKey;
@@ -2188,34 +2203,38 @@ void LsmTree::compactL0() {
       {
          u64 l1Min(root->l1Entries[i].minKey);
          u64 l1Max(root->l1Entries[i].maxKey);
-         if (!(l1Max < min || l1Min > max))
+         if (!(l1Max < min || l1Min > max))  // add only files from L1 that overlap with the files from L0
          {
             overlappingL1files.push_back(root->l1Entries[i].fileID);
          }
       }
    }
    vector<u64> filesToMerge = l0Files;
-   filesToMerge.insert(filesToMerge.end(), overlappingL1files.begin(), overlappingL1files.end());
-   vector<SSTableMetadata> finishedFiles = mergeOverlapping(filesToMerge, 1);
-   updateTables(0, l0Files, 1, overlappingL1files, finishedFiles);
+   filesToMerge.insert(filesToMerge.end(), overlappingL1files.begin(), overlappingL1files.end());   // add the files together in a single vector
+   vector<SSTableMetadata> finishedFiles = mergeOverlapping(filesToMerge, 1); // merge all these files into the target level
+   updateTables(0, l0Files, 1, overlappingL1files, finishedFiles);  // update the manifests
 
    {
-      unique_lock lock(readerMutex);
+      unique_lock lock(readerMutex);   // delete the readers of the merged files from the cache
       for (u64 oldID : filesToMerge)
       {
          readerCache.erase(oldID);
       }
    }
 
-   for (u64 oldID : filesToMerge)
+   for (u64 oldID : filesToMerge)   // delete the merged files from the disk
    {
       string path = "/tmp/sstables/" + to_string(oldID) + ".sst";
+      struct stat st;
+      if (stat(path.c_str(), &st) == 0)
+      {
+         bm.lsmSize -= st.st_size;  // used for space benchmark
+      }
       if (unlink(path.c_str()) != 0)
       {
          if (errno != ENOENT)
          {
             perror("unlink failed");
-            cout<< path << endl;
          }
       }
    }
@@ -2226,7 +2245,7 @@ void LsmTree::compactL0() {
 vector<SSTableMetadata> LsmTree::mergeOverlapping(const vector<u64>& filesToMerge, u16 targetLevel)
 {
    priority_queue<MergeIteratorEntry, vector<MergeIteratorEntry>, greater<>> queue; // queue is sorted by key ascending based on the compare operator
-   vector<unique_ptr<SSTableIterator>> iterators; // one iterator for each ssTable in L0
+   vector<unique_ptr<SSTableIterator>> iterators; // one iterator for each file that we are merging
    for (u64 fileID : filesToMerge)
    {
       try
@@ -2235,49 +2254,52 @@ vector<SSTableMetadata> LsmTree::mergeOverlapping(const vector<u64>& filesToMerg
          iterators.push_back(make_unique<SSTableIterator>(reader));
          if (iterators.back()->cont)
          {
-            queue.push({iterators.back().get(), fileID});
+            queue.push({iterators.back().get(), fileID});    // put the iterator in the queue
          }
       } catch (...)
       {
          continue;
       }
    }
-   u64 newID;
+   u64 newID;    // for the writer that will write the result of the merge
    unique_ptr<SSTableWriter> writer = nullptr;
-   vector<SSTableMetadata> finishedFiles;
+   vector<SSTableMetadata> finishedFiles;  // vector to keep the metadatas of the resulting files (will need to update manifests)
    string lastKey = "";
    bool first = true;
    while (!queue.empty())  // merge until all iterators reach end
    {
-      MergeIteratorEntry top = queue.top();
-      queue.pop();
+      MergeIteratorEntry top = queue.top();   //we take the first iterator (it ahs the lowest key since they are sorted)
+      queue.pop();   //take it out of the queue
       string currentKey(top.it->key);
-      if (first || currentKey != lastKey)
+      if (first || currentKey != lastKey)     // skip duplicates because the first one is most recent cause we have secondary sort fileID desc
       {
          if (!writer)
          {
             newID = getFileId();
             writer = make_unique<SSTableWriter>(newID);
          }
-         writer->addRecord(top.it->key, top.it->payload, top.it->isTombstone); // we don't use writeMemtable() because it would use to much ram
-         lastKey = currentKey;                                                // to load all sstable in RAM as levels get bigger
-         first = false;
-         if (writer->getCurrentSize() > MEMTABLE_CAPACITY )
+         if (targetLevel != 3 || !top.it->isTombstone)   // delete tomstones in level 3
          {
-            SSTableMetadata meta;
+            writer->addRecord(top.it->key, top.it->payload, top.it->isTombstone); // we don't use writeMemtable() because it would use too much RAM
+         }                                                                        // to load all sstable in RAM as levels get bigger
+         lastKey = currentKey;
+         first = false;
+         if (writer->getCurrentSize() > MEMTABLE_CAPACITY )    // if the sstable that we are writing noe gets too big we finish the sstable and start a new one
+         {
+            SSTableMetadata meta;   //write metadata
             meta.fileID = newID;
             meta.level = targetLevel;
-            writer->finish(meta);
+            writer->finish(meta);  // add it to the beginning of the file
             finishedFiles.push_back(meta);
-            writer.reset();
+            writer.reset();  // reset writer so we have to create new one
          }
       }
-      if (top.it->next())
+      if (top.it->next())  // if not at the end of iterator
       {
-         queue.push(top);
+         queue.push(top);  // we put it back in the queue so it has to sort it again
       }
    }
-   if (writer)
+   if (writer)    // finish last sstable
    {
       SSTableMetadata meta;
       meta.fileID = newID;
@@ -2288,20 +2310,22 @@ vector<SSTableMetadata> LsmTree::mergeOverlapping(const vector<u64>& filesToMerg
    }
    return finishedFiles;
 }
-
+   // update the maifests for merged files
 void LsmTree::updateTables(u16 fromLvl, const vector<u64>& filesToCompact, u16 targetLvl, const vector<u64>& overlappingFiles, const vector<SSTableMetadata>& results)
 {
-   vector<SSTableMetadata> remaining = results;
-   vector<u64> overlapping = overlappingFiles;
-   vector<u64> fromLvlVictims = filesToCompact;
+   vector<SSTableMetadata> remaining = results; // vector to keep the files we have to add if they don't all fit first try
+   vector<u64> overlapping = overlappingFiles;  // these we delete from target level
+   vector<u64> fromLvlVictims = filesToCompact;  // these we delete from the level that triggered the merge
    while (true)
    {
       bool needSpace = false;
       {
-         GuardX<LsmRootPage> root(LSM_ROOT_ID);
+         GuardX<LsmRootPage> root(LSM_ROOT_ID); // exclusive lock manifests because we will modify them
+
          u32* targetCount;
-         Level0Entry* targetEntries;
+         Level0Entry* targetEntries;   // we set these for the corresponding values
          u32 maxCapacity;
+
          if (targetLvl == 1)
          {
             targetCount = &root->l1_count;
@@ -2323,14 +2347,14 @@ void LsmTree::updateTables(u16 fromLvl, const vector<u64>& filesToCompact, u16 t
          }
          u32 survivingFiles = *targetCount - overlapping.size();
          u32 availableSlots = maxCapacity - survivingFiles;
-         u32 toAddCount = min<u32>(availableSlots, (u32)remaining.size());
+         u32 toAddCount = min<u32>(availableSlots, (u32)remaining.size()); //we can add maximum how many spaces are available or all we have left to add
          if (availableSlots > 0 || remaining.empty())
          {
-            if (!fromLvlVictims.empty())
+            if (!fromLvlVictims.empty())   // if merged files not deleted
             {
                if (fromLvl == 0)
                {
-                  vector<Level0Entry> remainingL0;
+                  vector<Level0Entry> remainingL0;    // vector to keep those not to be deleted on level 0
                   for (u32 i = 0; i < root->l0_count; i++)
                   {
                      bool victim = false;
@@ -2338,12 +2362,12 @@ void LsmTree::updateTables(u16 fromLvl, const vector<u64>& filesToCompact, u16 t
                      {
                         if (root->l0Entries[i].fileID == id) {victim = true; break;}
                      }
-                     if (!victim) remainingL0.push_back(root->l0Entries[i]);
+                     if (!victim) remainingL0.push_back(root->l0Entries[i]);   // we keep those that are not on the victim list
                   }
                   root->l0_count = remainingL0.size();
                   for (u32 i = 0; i < root->l0_count; i++)
                   {
-                     root->l0Entries[i] = remainingL0[i];
+                     root->l0Entries[i] = remainingL0[i];   // put those that are not victims back on manifest in same order but shifted to the start
                   }
                }
                else
@@ -2351,36 +2375,36 @@ void LsmTree::updateTables(u16 fromLvl, const vector<u64>& filesToCompact, u16 t
                   u32* srcCount = fromLvl == 1 ? &root->l1_count : &root->l2_count;
                   Level0Entry* srcEntries = fromLvl == 1 ? root->l1Entries : root->l2Entries;
                   applyMerge(srcCount, srcEntries, fromLvlVictims, {}, (fromLvl == 1) ? LsmRootPage::MAX_L1_FILES : LsmRootPage::MAX_L2_FILES);
-               }
-               fromLvlVictims.clear();
+               }  // this adds nothingto the level that triggered the merge but deletes the victims
+               fromLvlVictims.clear();  // no more need for this cause we deleted them
             }
-            vector<SSTableMetadata> batch;
+            vector<SSTableMetadata> batch;  // to be added to target level
             for (u32 i = 0; i < toAddCount; i++)
             {
-               batch.push_back(remaining.front());
+               batch.push_back(remaining.front()); // take from remaining and put in batch
                remaining.erase(remaining.begin());
             }
-            applyMerge(targetCount, targetEntries, overlapping, batch, maxCapacity);
-            overlapping.clear();
-            root->dirty = true;
+            applyMerge(targetCount, targetEntries, overlapping, batch, maxCapacity);  //batch will be added to target entries and overlapping will be deleted
+            overlapping.clear();  //these were deleted so we clear it
+            root->dirty = true; // mark root page dirty so buffer manager flushes it to disk
             if (remaining.empty())
             {
-               return;
+               return;  // done
             }
          }
-         else{ needSpace = true;}
+         else{ needSpace = true;} // they did not all fit so we need to compact next level
       }
       if (needSpace)
       {
-         compactLevel(targetLvl);
+         compactLevel(targetLvl); // trigger next level compaction and let another thread work
       }
       this_thread::yield();
    }
 }
-
+   // updates manifest of level where we compacted from and of target level
 void LsmTree::applyMerge(u32* count, Level0Entry* entries, const vector<u64>& toRemove, const vector<SSTableMetadata>& toAdd, u32 maxCap)
 {
-   vector<Level0Entry> keep;
+   vector<Level0Entry> keep; // entries not to be deleted
    for (u32 i = 0; i < *count; i++)
    {
       bool toDelete = false;
@@ -2388,30 +2412,30 @@ void LsmTree::applyMerge(u32* count, Level0Entry* entries, const vector<u64>& to
       {
          if (entries[i].fileID == id)
          {
-            toDelete = true; break;
+            toDelete = true; break;   // delete those that have id in toRemove vector
          }
       }
       if (!toDelete)
       {
-         keep.push_back(entries[i]);
+         keep.push_back(entries[i]);   // we keep the entry if it should not be deleted
       }
    }
    for (auto& m : toAdd)
    {
-      Level0Entry entry;
+      Level0Entry entry;  // make a manifest entry
       entry.fileID = m.fileID;
-      u64 minV = 0; u64 maxV = 0;
+      u64 minV = 0; u64 maxV = 0;  // set min and max key
       memcpy(&minV, m.minKey.data(), min<size_t>(m.minKey.size(), sizeof(u64)));
       memcpy(&maxV, m.maxKey.data(), min<size_t>(m.maxKey.size(), sizeof(u64)));
-      entry.minKey = __builtin_bswap64(minV);
+      entry.minKey = __builtin_bswap64(minV);   // swap bytes for big endian
       entry.maxKey = __builtin_bswap64(maxV);
-      keep.push_back(entry);
+      keep.push_back(entry);    // also keep it
    }
    sort(keep.begin(), keep.end(), [](const Level0Entry& a, const Level0Entry& b)
    {
-      return a.minKey < b.minKey;
+      return a.minKey < b.minKey;  // sort them to be in ascending order by key
    });
-   *count = min<u32>((u32)keep.size(), maxCap);
+   *count = min<u32>((u32)keep.size(), maxCap); // update the manifest count and entries
    for (u32 i = 0; i < *count; i++)
    {
       entries[i] = keep[i];
@@ -2419,36 +2443,36 @@ void LsmTree::applyMerge(u32* count, Level0Entry* entries, const vector<u64>& to
 }
 
 
-
+// same as compactL0, but now we know ranges are not overlapping inside a level
 void LsmTree::compactLevel(u16 sourceLevel)
 {
    u16 destLevel = sourceLevel + 1;
    if (destLevel > 3 || sourceLevel <= 0) return;  // maximum L3
-   if (levelCompacting[sourceLevel].exchange(true))
+   if (levelCompacting[sourceLevel].exchange(true))  //if the level is already being compacted cancel this compaction
    {
       return;
    }
    vector<u64> sourceVictims;
    vector<u64> overlapping;
    {
-      GuardS<LsmRootPage> root(LSM_ROOT_ID);
+      GuardS<LsmRootPage> root(LSM_ROOT_ID);    // lock root page and set source level and entries
       u32 count = sourceLevel == 1 ? root->l1_count : root->l2_count;
       Level0Entry* sourceEntries = sourceLevel == 1 ? root->l1Entries : root->l2Entries;
       if (count <= 0)
       {
-         levelCompacting[sourceLevel] = false;
+         levelCompacting[sourceLevel] = false;  // cannot compact if level is empty so abort, reset compacting state
          return;
       }
-      u32 batchSize = min<u32>(4, count);
-      u64 min, max;
+      u32 batchSize = min<u32>(4, count); //compact a batch of maximum 4
+      u64 min, max;  // for total key range of batch
       for (u16 i = 0; i < batchSize; i++)
       {
          if (i == 0) {min = sourceEntries[i].minKey; max = sourceEntries[i].maxKey;}
          sourceVictims.push_back(sourceEntries[i].fileID);
-         if (sourceEntries[i].minKey < min) min = sourceEntries[i].minKey;
+         if (sourceEntries[i].minKey < min) min = sourceEntries[i].minKey;  // find the smallest and biggest key
          if (sourceEntries[i].maxKey > max) max = sourceEntries[i].maxKey;
       }
-      u32 destCount = destLevel == 2 ? root->l2_count : root->l3_count;
+      u32 destCount = destLevel == 2 ? root->l2_count : root->l3_count;  // select destination
       Level0Entry* destEntries = destLevel == 2 ? root->l2Entries : root->l3Entries;
       if (destEntries)
       {
@@ -2458,154 +2482,246 @@ void LsmTree::compactLevel(u16 sourceLevel)
             u64 maxKey = destEntries[i].maxKey;
             if (!(maxKey < min || minKey > max))
             {
-               overlapping.push_back(destEntries[i].fileID);
+               overlapping.push_back(destEntries[i].fileID);  //select the files from the destination level that overlap with the batch
             }
          }
       }
    }
    if (sourceVictims.empty()) return;
-   vector<u64> filesToMerge =sourceVictims;
+   vector<u64> filesToMerge =sourceVictims;   //put all files to be merged together
    filesToMerge.insert(filesToMerge.end(), overlapping.begin(), overlapping.end());
-   vector<SSTableMetadata> results = mergeOverlapping(filesToMerge, destLevel);
-   updateTables(sourceLevel, sourceVictims, destLevel, overlapping, results);
-
+   vector<SSTableMetadata> results = mergeOverlapping(filesToMerge, destLevel);  // merge them into new sstables that we put on target level
+   updateTables(sourceLevel, sourceVictims, destLevel, overlapping, results); // update manifests of target level and source level and trigger target level compaction in necessary
    {
-      unique_lock lock(readerMutex);
+      unique_lock lock(readerMutex);   // remove readers of deleted files from cache
       for (u64 oldID : filesToMerge)
       {
          readerCache.erase(oldID);
       }
    }
-   for (u64 oldID : filesToMerge)
+   for (u64 oldID : filesToMerge) // delete te files that were deleted during merging
    {
       string path = "/tmp/sstables/" + to_string(oldID) + ".sst";
+      struct stat st;
+      if (stat(path.c_str(), &st) == 0)
+      {
+         bm.lsmSize -= st.st_size;
+      }
       if (unlink(path.c_str()) != 0)
       {
-         if (errno != ENOENT) cout << ("unlink failed");
+         if (errno != ENOENT) perror("unlink failed");;
       }
-      cout<< path + "deleted from l1" << endl;
    }
-   levelCompacting[sourceLevel] = false;
+   levelCompacting[sourceLevel] = false;  // done compacting so let this level be available for compaction again
 }
 
 template<class Fn>
-bool LsmTree::lookup(span<u8> key, Fn fn)
+bool LsmTree::lookup(span<u8> key, Fn fn)    // finds a key in the lsm tree and applies fn to it
 {
    u64 keyInt = 0;
    memcpy(&keyInt, key.data(), min(key.size(), sizeof(u64)));
-   keyInt = __builtin_bswap64(keyInt);
+   keyInt = __builtin_bswap64(keyInt);   // for comparison swap the byte order because we store min and max keys as int, not as string
    string keyStr(reinterpret_cast<const char*>(key.data()), key.size());
-   {                                                    // check memtable
+   {                                                    // check memtable for key
       lock_guard<mutex> lock(memtableMutex);
       auto it = memtable.find(keyStr);
-      if (it != memtable.end())
+      if (it != memtable.end())   // if it is in memtable
       {
-         if (!it->second.isTombstone)
+         if (!it->second.isTombstone)  // and is not deleted
          {
             span<u8> payload_span(reinterpret_cast<u8*>(it->second.payload.data()), it->second.payload.size());
-            fn(payload_span);
+            fn(payload_span);  // apply fn to the payload and return true
             return true;
          }
+         return false;  // found tombstone so is deleted
       }
    }
    {
       lock_guard<mutex> lock(immutableMemtablesMutex);    // check immutable memtables from newest to oldest
       for (auto it = immutableMemtables.rbegin(); it != immutableMemtables.rend(); ++it)
       {
-         auto mem_it = it->find(keyStr);
+         auto mem_it = it->find(keyStr);    // they are also memtables so same here
          if (mem_it != it->end())
          {
-            if (!mem_it->second.isTombstone)
+            if (!mem_it->second.isTombstone)  // found key
             {
                span<u8> payload_span(reinterpret_cast<u8*>(mem_it->second.payload.data()), mem_it->second.payload.size());
-               fn(payload_span);
+               fn(payload_span);  // apply fn to it and return true
                return true;
             }
-            return false;
+            return false; // found tombstone so the key was deleted
          }
       }
    }
-   vector<u64> candidateFiles;
+   vector<u64> candidateFiles;   // now we search through sstables and select the ones that might have the key in L0
    {
       GuardS<LsmRootPage> root(LSM_ROOT_ID);
-      for (int i = (int)root->l0_count - 1; i >= 0; i--)
+      for (int i = (int)root->l0_count - 1; i >= 0; i--)  // start from end (from most recent sstable)
       {
          u64 min = root->l0Entries[i].minKey;
          u64 max = root->l0Entries[i].maxKey;
-         if (keyInt >= min && keyInt <= max)
+         if (keyInt >= min && keyInt <= max)  // check if key is in the key range of the sstable
          {
-            candidateFiles.push_back(root->l0Entries[i].fileID);
+            candidateFiles.push_back(root->l0Entries[i].fileID);  // if yes we save the it so we know to check this sstable
          }
       }
 
-      for (u64 fileID : candidateFiles)
+      for (u64 fileID : candidateFiles)  // now we check the tables we saved
       {
          try
          {
             auto reader = getReader(fileID);
-            if (reader->lookup(key,fn)) return true;
+            u16 result = reader->lookup(key,fn);
+            if (result == 1) return false; //found it but is tombstone, so we want to stop looking, as the first time we find it, it is the most recent entry
+            if (result == 2) return true;
          } catch (...)
          {
             continue;
          }
       }
-      auto checkLevel = [&](u32 count, Level0Entry* entries) -> u64
+      auto checkLevel = [&](u32 count, Level0Entry* entries) -> u64   // function to check the files of a level, for levels 1,2,3
       {
-         for (u32 i = 0; i < count; i++)
+         for (u32 i = 0; i < count; i++)   // in level 1,2,3 files don't have overlapping key ranges so the key can only be in one file
          {
-            if (keyInt >= entries[i].minKey && keyInt <= entries[i].maxKey) return entries[i].fileID;
+            if (keyInt >= entries[i].minKey && keyInt <= entries[i].maxKey) return entries[i].fileID;   // we select the one file that can have the key
          }
          return 0;
       };
       u64 id;
-      if ((id = checkLevel(root->l1_count, root->l1Entries))) if (getReader(id)->lookup(key, fn)) return true;
-      if ((id = checkLevel(root->l2_count, root->l2Entries))) if (getReader(id)->lookup(key, fn)) return true;
-      if ((id = checkLevel(root->l3_count, root->l3Entries))) if (getReader(id)->lookup(key, fn)) return true;
+      if ((id = checkLevel(root->l1_count, root->l1Entries))) if (getReader(id)->lookup(key, fn) == 2) return true;   // if it is tombstone we want to return false
+      if ((id = checkLevel(root->l2_count, root->l2Entries))) if (getReader(id)->lookup(key, fn) == 2) return true;
+      if ((id = checkLevel(root->l3_count, root->l3Entries))) if (getReader(id)->lookup(key, fn) == 2) return true;
    }
-   return false;
+   return false;  // not found, finished all levels we can check
 }
 
-bool LsmTree::remove(span<u8> key)
+bool LsmTree::remove(span<u8> key)   // basically an insert with payload 0 and tombstone true
 {
    span<u8> empty_payload = {};
    for (u64 repeat = 0; ; repeat++) {
       try
       {
-         string keyStr(reinterpret_cast<const char*>(key.data()), key.size());
-         unique_lock<mutex> lock(memtableMutex);
+         string keyStr(reinterpret_cast<const char*>(key.data()), key.size());  // cast key to string so we can use it
+         unique_lock<mutex> lock(memtableMutex);  //lock memtable
          size_t entry_size;
          auto it = memtable.find(keyStr);  // check if entry key is in the memtable map
          if (it != memtable.end())  // if it is, the entry_size is the deleted payload size
          {
             entry_size = 0 - it->second.payload.size();
          }
-         else   // if it is not in, it is overhead of entry with 0 payload
+         else   // if it is not in, the size is overhead of entry with 0 payload
          {
             entry_size = sizeof(MemtableEntry) + keyStr.size();
          }
          if (memtableSize.load() + entry_size > MEMTABLE_CAPACITY)  // if buffer full, flush
          {
-            lock.unlock();
+            lock.unlock();  // release lock because flush needs to acces memtable
             flush();
             throw OLCRestartException();
          }
-         if (it != memtable.end())
+         if (it != memtable.end())  // if is in we update it
          {
             it->second = MemtableEntry(empty_payload, true);
          }
-         else
+         else // if it is not already in memtable, we insert it
          {
             memtable.emplace(move(keyStr), MemtableEntry(empty_payload, true));
          }
          memtableSize += entry_size;
          return true; // Success, exit infinite loop
       }
-      catch (const OLCRestartException&)
+      catch (const OLCRestartException&)  // was unsuccesfull (memtable was full) so retry
       {
          yield(repeat);
       }
    }
 }
+
+template <class Fn>
+void LsmTree::scanAsc(span<u8> key, Fn fn)  // find the key and start reading the following keys in ascending order until fn returns false
+{  // so after we find key, we then look for the next smallest key bigger then key in the entire tree, that means we have to merge all the sstables in a priority queue and iterate through it
+   string startKey(reinterpret_cast<const char*>(key.data()), key.size());  // that can be done, but is extremely inefficient, so we will just search in the memtable
+   lock_guard<mutex> lock(memtableMutex);
+   auto memIt = memtable.lower_bound(startKey);  // returns iterator pointing to key or to next smallest entry if key not in
+   /*u64 startKeyInt = 0;
+   memcpy(&startKeyInt, key.data(), min(key.size(), sizeof(u64)));
+   startKeyInt = __builtin_bswap64(startKeyInt);
+   priority_queue<MergeIteratorEntry, vector<MergeIteratorEntry>, greater<>> queue;
+   vector<unique_ptr<SSTableIterator>> iterators;
+   auto memIt = memtable.lower_bound(startKey);
+   vector<u64> candidates;
+   {
+      GuardS<LsmRootPage> root(LSM_ROOT_ID);
+      auto addCandidates = [&](u32 count, Level0Entry* entries)
+      {
+         for (u32 i = 0; i < count; i++)
+         {
+            if (entries[i].maxKey >= startKeyInt)
+            {
+               candidates.push_back(entries[i].fileID);
+            }
+         }
+      };
+      addCandidates(root->l0_count, root->l0Entries);
+      addCandidates(root->l1_count, root->l1Entries);
+      addCandidates(root->l2_count, root->l2Entries);
+      addCandidates(root->l3_count, root->l3Entries);
+
+   }
+   for (u64 id : candidates)
+   {
+      try
+      {
+         auto reader = getReader(id);
+         auto it = make_unique<SSTableIterator>(reader);
+         while (it->cont && it->key < startKey) {it->next();}  // go to start key
+         if (it->cont)
+         {
+            queue.push({it.get(), id});
+            iterators.push_back(move(it));
+         }
+      } catch (...) {}
+   }
+   string lastKey = "";
+   */
+   while (memIt != memtable.end())  //until we reach the end of the memtable
+   {
+      /*
+      bool useMemtable = false;
+      if (memIt != memtable.end())
+      {
+         if (queue.empty()) useMemtable = true;
+         else if (memIt->first < queue.top().it->key) useMemtable = true;
+      }
+      string currentKey, currentPayload;
+      bool isTombstone;
+      if (useMemtable)
+      {
+         currentKey = memIt->first;
+         currentPayload = memIt->second.payload;
+         isTombstone = memIt->second.isTombstone;
+         memIt++;
+      } else
+      {
+         auto top = queue.top();
+         queue.pop();
+         currentKey = string(top.it->key);
+         currentPayload = string(top.it->payload);
+         isTombstone = top.it->isTombstone;
+         if (top.it->next()) queue.push(top);
+      }
+      if (currentKey == lastKey) continue;
+      lastKey = currentKey;
+      if (isTombstone) continue;
+      */
+      if (memIt->second.isTombstone) {memIt++; continue;}  // we skip if it is tombstone
+
+      bool cont = fn(span<u8>((u8*)memIt->first.data(), memIt->first.size()), span<u8>((u8*)memIt->second.payload.data(), memIt->second.payload.size()));
+      if (!cont) break;   // if fn returned false we stop
+      memIt++;  // go to next entry in memtable, since it is sorted
+   }
+}
+
 
 
 static unsigned btreeslotcounter = 0;
@@ -2756,7 +2872,7 @@ void handleSEGFAULT(int signo, siginfo_t* info, void* extra) {
    }
 }
 
-#ifdef USE_LSM_TREE
+#ifdef USE_LSM_TREE    //choose at compile time if you want the lsm or btree version
    using Tree = LsmTree;
    #define TREE "LsmTree"
 #else
@@ -2775,12 +2891,10 @@ struct vmcacheAdapter
       u8 k[Record::maxFoldLength()];
       u16 l = Record::foldKey(k, key);
       u8 kk[Record::maxFoldLength()];
-      tree.scanAsc({k, l}, [&](BTreeNode& node, unsigned slot) {
-         memcpy(kk, node.getPrefix(), node.prefixLen);
-         memcpy(kk+node.prefixLen, node.getKey(slot), node.slot[slot].keyLen);
+      tree.scanAsc({k, l}, [&](span<u8> key, span<u8> payload) {  //modified so lsm tree can also use them
          typename Record::Key typedKey;
-         Record::unfoldKey(kk, typedKey);
-         return found_record_cb(typedKey, *reinterpret_cast<const Record*>(node.getPayload(slot).data()));
+         Record::unfoldKey(key.data(), typedKey);
+         return found_record_cb(typedKey, *reinterpret_cast<const Record*>(payload.data()));
       });
    }
    // -------------------------------------------------------------------------------------
@@ -2788,18 +2902,10 @@ struct vmcacheAdapter
       u8 k[Record::maxFoldLength()];
       u16 l = Record::foldKey(k, key);
       u8 kk[Record::maxFoldLength()];
-      bool first = true;
-      tree.scanDesc({k, l}, [&](BTreeNode& node, unsigned slot, bool exactMatch) {
-         if (first) { // XXX: hack
-            first = false;
-            if (!exactMatch)
-               return true;
-         }
-         memcpy(kk, node.getPrefix(), node.prefixLen);
-         memcpy(kk+node.prefixLen, node.getKey(slot), node.slot[slot].keyLen);
+      tree.scanDesc({k, l}, [&](span<u8> keySpan, span<u8> payload) {   //modified so lsm tree can also use them
          typename Record::Key typedKey;
-         Record::unfoldKey(kk, typedKey);
-         return found_record_cb(typedKey, *reinterpret_cast<const Record*>(node.getPayload(slot).data()));
+         Record::unfoldKey(keySpan.data(), typedKey);
+         return found_record_cb(typedKey, *reinterpret_cast<const Record*>(payload.data()));
       });
    }
    // -------------------------------------------------------------------------------------
@@ -2935,7 +3041,7 @@ int main(int argc, char** argv) {
             }
          });
       }
-      cerr << "space: " << (bm.allocCount.load()*pageSize)/(float)bm.gb << " GB " << endl;
+      cerr << "space: " << ((bm.allocCount.load()*pageSize) + bm.lsmSize.load())/(float)bm.gb << " GB " << endl;
 
       bm.readCount = 0;
       bm.writeCount = 0;
@@ -3004,8 +3110,7 @@ int main(int argc, char** argv) {
          }
       });
    }
-   cerr << "space: " << (bm.allocCount.load()*pageSize)/(float)bm.gb << " GB " << endl;
-
+   cerr << "space: " << ((bm.allocCount.load()*pageSize) + bm.lsmSize.load())/(float)bm.gb << " GB " << endl;
    bm.readCount = 0;
    bm.writeCount = 0;
    thread statThread(statFn);
@@ -3029,7 +3134,7 @@ int main(int argc, char** argv) {
    });
 
    statThread.join();
-   cerr << "space: " << (bm.allocCount.load()*pageSize)/(float)bm.gb << " GB " << endl;
+   cerr << "space: " << ((bm.allocCount.load()*pageSize) + bm.lsmSize.load())/(float)bm.gb << " GB " << endl;
 
    return 0;
 }
