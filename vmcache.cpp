@@ -1504,7 +1504,7 @@ struct MemtableEntry
    string payload;
    bool isTombstone = false;
    MemtableEntry(span<u8> payload_span, bool tombstone = false) :
-   payload(reinterpret_cast<const char*>(payload_span.data()), payload_span.size()) {};
+   payload(reinterpret_cast<const char*>(payload_span.data()), payload_span.size()), isTombstone(tombstone) {};
    MemtableEntry() = default;
 };
 using Memtable = map<string, MemtableEntry>;   // we use a map as the memtable since it stores data sorted after the keys
@@ -1772,6 +1772,7 @@ void SSTableReader::loadIndex()
          memcpy(&len, blockBuffer + bufferOffset, sizeof(u16));
          bufferOffset += sizeof(u16);
          if (len == 0) break;
+         if (bufferOffset + len + 2 + 8 > SSTABLE_BLOCK_SIZE) break;
          BlockIndexEntry entry;
          entry.lastKey.assign((char*)(blockBuffer + bufferOffset), len);
          bufferOffset += len;
@@ -1790,8 +1791,8 @@ struct SSTableIterator   // used to iterate through an sstable, entry by entry, 
    u64 currentBlockIndex =  0;
    u64 offsetInBlock = 0;
    bool cont = false;
-   string_view key;
-   string_view payload;
+   string key;
+   string payload;
    bool isTombstone;
 
    SSTableIterator(shared_ptr<SSTableReader> reader) : reader(reader)
@@ -1845,8 +1846,8 @@ struct SSTableIterator   // used to iterate through an sstable, entry by entry, 
          return cont;
       }
       u8* payloadPtr = keyPtr + keyLen + sizeof(u16);
-      key = string_view((char*)keyPtr, keyLen);         // read key, payload and tombstone
-      payload = string_view((char*)payloadPtr, payloadLen);
+      key = string((char*)keyPtr, keyLen);         // read key, payload and tombstone
+      payload = string((char*)payloadPtr, payloadLen);
       isTombstone = *(payloadPtr + payloadLen);
       offsetInBlock += payloadLen + keyLen + sizeof(u16) + sizeof(u16) + sizeof(u8); // move to next entry in block
       return true;
@@ -1978,7 +1979,7 @@ template <class Fn>
 bool LsmTree::updateInPlace(span<u8> key, Fn fn)  // find the value and insert the updated value, no such thing as an update in place in an lsm tree
 {     // we need to lock the specific entry while doing this, so this function is thread safe
       // we can't have a separate mutex for each key, but we can hash the key. we have 1024 buckets s oit is improbable they collide
-   string_view view = (key.data(),key.size());
+   string_view view(reinterpret_cast<const char*>(key.data()),key.size());
    size_t bucket = hash<string_view>{}(view) % 1024;   // use c++ included hash
    lock_guard<mutex> updateLock(updateMutexes[bucket]);   // if already taken, thread will wait here
 
@@ -1994,7 +1995,7 @@ bool LsmTree::updateInPlace(span<u8> key, Fn fn)  // find the value and insert t
    });
    if (!found) return false;
    fn(span<u8>(buffer, payloadLen));   // if found we apply the function and insert it
-   this->insert(key, {buffer, payloadLen});
+   this->insert(key, {buffer, payloadLen});   // TODO : payloadLen needs to be updated by fn
    return true;
 }
 
@@ -2273,6 +2274,7 @@ vector<SSTableMetadata> LsmTree::mergeOverlapping(const vector<u64>& filesToMerg
    vector<SSTableMetadata> finishedFiles;  // vector to keep the metadatas of the resulting files (will need to update manifests)
    string lastKey = "";
    bool first = true;
+   u64 mergeCount = 0;
    while (!queue.empty())  // merge until all iterators reach end
    {
       MergeIteratorEntry top = queue.top();   //we take the first iterator (it ahs the lowest key since they are sorted)
@@ -2280,6 +2282,7 @@ vector<SSTableMetadata> LsmTree::mergeOverlapping(const vector<u64>& filesToMerg
       string currentKey(top.it->key);
       if (first || currentKey != lastKey)     // skip duplicates because the first one is most recent cause we have secondary sort fileID desc
       {
+         mergeCount++;
          if (!writer)
          {
             newID = getFileId();
@@ -2289,7 +2292,7 @@ vector<SSTableMetadata> LsmTree::mergeOverlapping(const vector<u64>& filesToMerg
          {
             writer->addRecord(top.it->key, top.it->payload, top.it->isTombstone); // we don't use writeMemtable() because it would use too much RAM
          }                                                                        // to load all sstable in RAM as levels get bigger
-         lastKey = currentKey;
+         lastKey = move(currentKey);
          first = false;
          if (writer->getCurrentSize() > MEMTABLE_CAPACITY )    // if the sstable that we are writing noe gets too big we finish the sstable and start a new one
          {
@@ -2298,6 +2301,7 @@ vector<SSTableMetadata> LsmTree::mergeOverlapping(const vector<u64>& filesToMerg
             meta.level = targetLevel;
             writer->finish(meta);  // add it to the beginning of the file
             finishedFiles.push_back(meta);
+
             writer.reset();  // reset writer so we have to create new one
          }
       }
@@ -2313,6 +2317,7 @@ vector<SSTableMetadata> LsmTree::mergeOverlapping(const vector<u64>& filesToMerg
       meta.level = targetLevel;
       writer->finish(meta);
       finishedFiles.push_back(meta);
+
       writer.reset();
    }
    return finishedFiles;
@@ -2328,7 +2333,6 @@ void LsmTree::updateTables(u16 fromLvl, const vector<u64>& filesToCompact, u16 t
       bool needSpace = false;
       {
          GuardX<LsmRootPage> root(LSM_ROOT_ID); // exclusive lock manifests because we will modify them
-
          u32* targetCount;
          Level0Entry* targetEntries;   // we set these for the corresponding values
          u32 maxCapacity;
@@ -2569,7 +2573,7 @@ bool LsmTree::lookup(span<u8> key, Fn fn)    // finds a key in the lsm tree and 
          u64 max = root->l0Entries[i].maxKey;
          if (keyInt >= min && keyInt <= max)  // check if key is in the key range of the sstable
          {
-            candidateFiles.push_back(root->l0Entries[i].fileID);  // if yes we save the it so we know to check this sstable
+            candidateFiles.push_back(root->l0Entries[i].fileID);  // if yes we save it so we know to check this sstable
          }
       }
 
@@ -2996,6 +3000,53 @@ void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
       t.join();
 }
 
+void runAutomaticTests(LsmTree& lsm)
+{
+   cout << "LSM Correctness Tests" << endl;
+
+   // Test 1: insert
+   string key = "user123";
+   string val = "hello_world";
+   lsm.insert(span<u8>((u8*)key.data(), key.size()), span<u8>((u8*)val.data(), val.size()));
+
+   bool found = lsm.lookup(span<u8>((u8*)key.data(), key.size()), [&](span<u8> payload) {
+      assert(string((char*)payload.data(), payload.size()) == val);
+   });
+   assert(found);
+   cout << "PASS basic insert and lookup" << endl;
+
+   // Test 2: Update
+   string val2 = "new_value";
+   lsm.insert(span<u8>((u8*)key.data(), key.size()), span<u8>((u8*)val2.data(), val2.size()));
+   lsm.lookup(span<u8>((u8*)key.data(), key.size()), [&](span<u8> payload) {
+      assert(string((char*)payload.data(), payload.size()) == val2);
+   });
+   cout << "PASS insert new value with same key and lookup" << endl;
+
+   // Test 3: Delete
+   lsm.remove(span<u8>((u8*)key.data(), key.size()));
+   bool stillExists = lsm.lookup(span<u8>((u8*)key.data(), key.size()), [&](span<u8> p){});
+   assert(!stillExists);
+   cout << "PASS Tombstone" << endl;
+
+   // Test 4: 10 mil inserts to trigger flushes
+   cout << "Testing large scale inserts (triggering flushes)..." << endl;
+   for (int i = 0; i < 17000000; i++) {
+      string k = "key_" + to_string(i);
+      string v = "val_" + to_string(i);
+      lsm.insert(span<u8>((u8*)k.data(), k.size()), span<u8>((u8*)v.data(), v.size()));
+   }
+   this_thread::sleep_for(chrono::seconds(20));
+   // Verify a random key from the middle
+   string searchK = "key_2700000";
+   bool found1 = lsm.lookup(span<u8>((u8*)searchK.data(), searchK.size()), [&](span<u8> p){
+       assert(string((char*)p.data(), p.size()) == "val_2700000");
+   });
+   assert(found1);
+   cout << "PASS multi-level lookup" << endl;
+}
+
+
 int main(int argc, char** argv) {
    if (bm.useExmap) {
       struct sigaction action;
@@ -3005,6 +3056,14 @@ int main(int argc, char** argv) {
          perror("sigusr: sigaction");
          exit(1);
       }
+   }
+   Tree bt;
+   if (argc > 1 && string(argv[1]) == "--test")
+   {
+#ifdef USE_LSM_TREE
+      runAutomaticTests(bt);
+#endif
+      return 0;
    }
 
    unsigned nthreads = envOr("THREADS", 1);
@@ -3018,7 +3077,6 @@ int main(int argc, char** argv) {
    auto systemName = bm.useExmap ? "exmap" : "vmcache";
 
    auto statFn = [&]() {
-      std::cout << "RootPage size: " << sizeof(LsmRootPage) << " bytes" << std::endl;   // TODO : remove
       cout << "ts,tx,rmb,wmb,system,threads,datasize,workload,batch" << endl;
       u64 cnt = 0;
       for (uint64_t i=0; i<runForSec; i++) {
@@ -3032,7 +3090,6 @@ int main(int argc, char** argv) {
    };
 
    if (isRndread) {
-      Tree bt;
       bt.splitOrdered = true;
 
       {
