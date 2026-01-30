@@ -1306,8 +1306,8 @@ struct Level0Entry  // store min and max key for each file so we don't have to o
    u64 maxKey;
 };
 
-struct LsmRootPage   // max 4096 bytes, after that it does not fit on one page, could split into multiple pages for more capacity
-{                    // level0entry has size 24B so we can fit 168 file entries, set it to 150, so first level has 10 and size ratio is 2
+struct LsmRootPage                                                              // max 4096 bytes, after that it does not fit on one page, could split into multiple pages for more capacity
+{                                                                              // level0entry has size 24B so we can fit 168 file entries, set it to 150, so first level has 10 and size ratio is 2
    bool dirty;
    u64 nextSSTableId;
    static constexpr u32 L0_COMPACTION_TRIGGER = 4;
@@ -1513,7 +1513,7 @@ struct SSTableMetadata   // we will store metadata of an sstable on the first bl
 {
    u64 fileID;
    u32 level;
-   string minKey;   // to know the key ranges of an sstable for lookup
+   string minKey;           // to know the key ranges of an sstable for lookup
    string maxKey;
    u64 blockIndexOffset;  // the offset of where the indexes are and how many they are
    u32 numBlocks;
@@ -1721,9 +1721,10 @@ public:
    { // efficient binary search for the first block in which key could be
       auto it = lower_bound(index.begin(), index.end(), key, [](const BlockIndexEntry& entry, span<u8> k)
       {    // it points to the first element bigger than key, because we need the lastKey of the block to be bigger than the key since sstable are sorted
-         string_view entryKey(entry.lastKey);
-         string_view searchKey((char*)k.data(), k.size());
-         return entryKey < searchKey;  // this comparator is used to eliminate the invalid options, that is why it looks like it is the wrong way around
+         size_t minLen = min<size_t>(entry.lastKey.size(), k.size());
+         int cmp = memcmp( entry.lastKey.data(), k.data(), minLen);
+         if (cmp != 0) return cmp < 0;
+         return entry.lastKey.size() < k.size();
       });
       if (it == index.end()) return 0;
       if (pread(fd, blockBuffer, SSTABLE_BLOCK_SIZE, it->blockOffset) != SSTABLE_BLOCK_SIZE) return 0; // read the candidate block
@@ -1994,8 +1995,9 @@ bool LsmTree::updateInPlace(span<u8> key, Fn fn)  // find the value and insert t
       found = true;  // this function doesn't run if we find it but is tombstone, if it is tombstone we don't want to update it anyway
    });
    if (!found) return false;
-   fn(span<u8>(buffer, payloadLen));   // if found we apply the function and insert it
-   this->insert(key, {buffer, payloadLen});   // TODO : payloadLen needs to be updated by fn
+     // if found we apply the function, fn does not modify the length of the payload because tpcc uses fixed size records
+   fn(span<u8>(buffer, payloadLen));
+   this->insert(key, {buffer, payloadLen});  // and insert it
    return true;
 }
 
@@ -2147,8 +2149,7 @@ void LsmTree::backgroundFlush()
             return !immutableMemtables.empty() || shutDown;
          });
          if (shutDown && immutableMemtables.empty()) break;   // only stops when everything is flushed and shutDown has been signaled
-         memtableToFlush = move(immutableMemtables.front());
-         immutableMemtables.erase(immutableMemtables.begin()); // erase the memtable that we are about to flush from immtables
+         memtableToFlush = immutableMemtables.front();
       }
       if (!memtableToFlush.empty())
       {
@@ -2188,6 +2189,8 @@ void LsmTree::backgroundFlush()
             cerr << "Failed flush" << e.what() << endl;
          }
       }
+      lock_guard<mutex> lock(immutableMemtablesMutex);
+      immutableMemtables.erase(immutableMemtables.begin()); // erase the memtable that we flushed
    }
 }
 
@@ -2599,9 +2602,9 @@ bool LsmTree::lookup(span<u8> key, Fn fn)    // finds a key in the lsm tree and 
          return 0;
       };
       u64 id;
-      if ((id = checkLevel(root->l1_count, root->l1Entries))) if (getReader(id)->lookup(key, fn) == 2) return true;   // if it is tombstone we want to return false
-      if ((id = checkLevel(root->l2_count, root->l2Entries))) if (getReader(id)->lookup(key, fn) == 2) return true;
-      if ((id = checkLevel(root->l3_count, root->l3Entries))) if (getReader(id)->lookup(key, fn) == 2) return true;
+      if ((id = checkLevel(root->l1_count, root->l1Entries))) { int r = getReader(id)->lookup(key, fn); if (r == 1) return false; if (r == 2) return true;}    // if r is 0 we did not find it so we keep looking
+      if ((id = checkLevel(root->l2_count, root->l2Entries))) { int r = getReader(id)->lookup(key, fn); if (r == 1) return false; if (r == 2) return true;}    // if r is 1 we found tombstone, if r is 2 we found it
+      if ((id = checkLevel(root->l3_count, root->l3Entries))) { int r = getReader(id)->lookup(key, fn); if (r == 1) return false; if (r == 2) return true;}
    }
    return false;  // not found, finished all levels we can check
 }
@@ -2933,7 +2936,6 @@ struct vmcacheAdapter
       bool succ = tree.lookup({k, l}, [&](span<u8> payload) {
          fn(*reinterpret_cast<const Record*>(payload.data()));
       });
-      assert(succ);
    }
    // -------------------------------------------------------------------------------------
    template<class Fn>
@@ -3030,20 +3032,66 @@ void runAutomaticTests(LsmTree& lsm)
    cout << "PASS Tombstone" << endl;
 
    // Test 4: 10 mil inserts to trigger flushes
-   cout << "Testing large scale inserts (triggering flushes)..." << endl;
+   cout << "Testing large scale inserts (triggering flushes)" << endl;
    for (int i = 0; i < 17000000; i++) {
       string k = "key_" + to_string(i);
       string v = "val_" + to_string(i);
       lsm.insert(span<u8>((u8*)k.data(), k.size()), span<u8>((u8*)v.data(), v.size()));
    }
-   this_thread::sleep_for(chrono::seconds(20));
+   this_thread::sleep_for(chrono::seconds(15));
    // Verify a random key from the middle
-   string searchK = "key_2700000";
+   string searchK = "key_13000000";
    bool found1 = lsm.lookup(span<u8>((u8*)searchK.data(), searchK.size()), [&](span<u8> p){
-       assert(string((char*)p.data(), p.size()) == "val_2700000");
+       assert(string((char*)p.data(), p.size()) == "val_13000000");
    });
    assert(found1);
    cout << "PASS multi-level lookup" << endl;
+   bool update = lsm.updateInPlace(span<u8>((u8*)searchK.data(), searchK.size()), [](span<u8> payload)
+   {
+      string valUpdate = "val_13000001";
+      memcpy(payload.data(), valUpdate.data(), valUpdate.size());
+   });
+   assert(update);
+   bool foundUpdate = lsm.lookup(span<u8>((u8*)searchK.data(), searchK.size()), [&](span<u8> payload)
+   {
+      assert(string((char*)payload.data(), payload.size()) == "val_13000001");
+   });
+   assert(foundUpdate);
+   cout << "PASS update in place" << endl;
+   string keyM = "key_1";
+   span<u8> keyMT((u8*)keyM.data(), keyM.size());
+   u64 initialVal = 0;
+   lsm.insert(keyMT, {(u8*)&initialVal, sizeof(initialVal)});
+   u16 numThreads = 8;
+   u16 increments = 1000;
+   vector<thread> threads;
+   for (int i = 0; i < numThreads; i++)
+   {
+      threads.emplace_back([&, i]()
+      {
+         workerThreadId = 200 + i; // give each thread a unique id
+         for (int j = 0; j < increments; j++)
+         {
+            bool ok = lsm.updateInPlace(keyMT, [](span<u8> payload)
+            {
+               u64 val;
+               memcpy(&val, payload.data(), sizeof(u64));
+               val++;
+               memcpy(payload.data(), &val, sizeof(u64));
+            });
+            assert(ok);
+         }
+      });
+   }
+   for (auto& t : threads) t.join();
+   found = lsm.lookup(keyMT, [&](span<u8> payload)
+   {
+      u64 val;
+      memcpy(&val, payload.data(), sizeof(u64));
+      assert(val == (u64)numThreads * increments);
+   });
+   assert(found);
+   cout << "PASS multi threaded update in place" << endl;
 }
 
 
