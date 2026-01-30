@@ -18,6 +18,10 @@ Code repository for SIGMOD'23 paper [Virtual-Memory Assisted Buffer Management](
 
 * TPC-C, 4 threads, 2 warehouses: `BLOCK=/dev/nvme0n1 THREADS=4 DATASIZE=2 ./vmcache`
 * random read, 10 threads, 1 million tuples: `BLOCK=/dev/md0 THREADS=10 DATASIZE=1e6 ./vmcache`
+* LSM Tree: before each test run `rm /tmp/bm /tmp/sstables/*.sst` `dd if=/dev/zero of=/tmp/bm bs=1M count=4096` 
+* LSM TRee make: `make vmcache_lsm` Btree make: `make vmcache_btree`
+* LSM Tree benchmark: `./vmcache` and can adjust threads and datasize
+* LSM TREE correctness tests: `./vmcache --test`
 
 ## Dependencies and Configuration
 
